@@ -1,0 +1,42 @@
+{
+  "name": "token4u-mcp",
+  "version": "0.3.0",
+  "type": "module",
+  "description": "Token4u MCP Server - x402 micropayments for AI agents. Wallet management, USDC top-up, x402 paid LLM calls.",
+  "bin": {
+    "token4u-mcp": "./dist/index.js",
+    "token4u-mcp-beta": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/openclawff/token4u-mcp.git"
+  },
+  "license": "MIT",
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --clean",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^4.3.5",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsup": "^8.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}
