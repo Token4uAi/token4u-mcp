@@ -27,3 +27,22 @@ export const EIP3009_DOMAIN = {
   chainId: 8453,
   verifyingContract: USDC_BASE,
 };
+
+// ---------------------------------------------------------------------------
+// Permit2 constants (upto scheme)
+// ---------------------------------------------------------------------------
+
+/** Permit2 canonical contract (CREATE2, same address on all EVM chains). */
+export const PERMIT2_CONTRACT =
+  '0x000000000022D473030F116dDEE9F6B43aC78BA3';
+
+/** x402 Upto Permit2 proxy — the spender in PermitWitnessTransferFrom. */
+export const PERMIT2_SPENDER =
+  '0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002';
+
+/** EIP-712 domain for Permit2 (no version, no salt). */
+export const PERMIT2_DOMAIN = {
+  name: 'Permit2',
+  chainId: 8453,
+  verifyingContract: PERMIT2_CONTRACT,
+} as const;

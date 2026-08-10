@@ -178,14 +178,18 @@ describe('signEip3009', () => {
       { validForSec: 3600 },
     );
 
+    // signEip3009 always returns authorization + signature.
+    const sig = payload.signature!;
+    const auth = payload.authorization!;
+
     // Verify structure.
-    assert.ok(payload.signature.startsWith('0x'));
-    assert.strictEqual(payload.authorization.from, TEST_ADDRESS);
-    assert.strictEqual(payload.authorization.to, FIXTURE_ACCEPT.payTo);
-    assert.strictEqual(payload.authorization.value, FIXTURE_ACCEPT.amount);
-    assert.strictEqual(payload.authorization.validAfter, '0');
-    assert.ok(payload.authorization.nonce.startsWith('0x'));
-    assert.strictEqual(payload.authorization.nonce.length, 66); // 32 bytes hex
+    assert.ok(sig.startsWith('0x'));
+    assert.strictEqual(auth.from, TEST_ADDRESS);
+    assert.strictEqual(auth.to, FIXTURE_ACCEPT.payTo);
+    assert.strictEqual(auth.value, FIXTURE_ACCEPT.amount);
+    assert.strictEqual(auth.validAfter, '0');
+    assert.ok(auth.nonce.startsWith('0x'));
+    assert.strictEqual(auth.nonce.length, 66); // 32 bytes hex
 
     // Verify the signature cryptographically.
     const recovered = await recoverTypedDataAddress({
@@ -212,10 +216,10 @@ describe('signEip3009', () => {
         to: FIXTURE_ACCEPT.payTo as `0x${string}`,
         value: BigInt(FIXTURE_ACCEPT.amount),
         validAfter: 0n,
-        validBefore: BigInt(Number(payload.authorization.validBefore)),
-        nonce: payload.authorization.nonce as `0x${string}`,
+        validBefore: BigInt(Number(auth.validBefore)),
+        nonce: auth.nonce as `0x${string}`,
       },
-      signature: payload.signature,
+      signature: sig,
     });
 
     assert.strictEqual(

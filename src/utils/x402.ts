@@ -3,7 +3,13 @@ import { randomBytes } from 'node:crypto';
 import { privateKeyToAccount } from 'viem/accounts';
 import type { PrivateKeyAccount } from 'viem/accounts';
 
-import { USDC_BASE, EIP3009_DOMAIN } from '../config.js';
+import {
+  USDC_BASE,
+  EIP3009_DOMAIN,
+  PERMIT2_DOMAIN,
+  PERMIT2_SPENDER,
+} from '../config.js';
+import type { Permit2Authorization as Permit2Auth } from '../types.js';
 import { streamChatCompletion } from './chat-stream.js';
 import type { StreamResult } from './chat-stream.js';
 
@@ -37,8 +43,9 @@ export interface Eip3009Authorization {
 }
 
 export interface PaymentPayload {
-  authorization: Eip3009Authorization;
-  signature: `0x${string}`;
+  authorization?: Eip3009Authorization;
+  signature?: `0x${string}`;
+  permit2Authorization?: Permit2Auth;
 }
 
 interface PaymentHeaderObject {
@@ -234,6 +241,100 @@ export async function signEip3009(
 }
 
 // ---------------------------------------------------------------------------
+// 3b. signPermit2 — Permit2 PermitWitnessTransferFrom (upto scheme)
+// ---------------------------------------------------------------------------
+
+const PERMIT2_TYPES = {
+  TokenPermissions: [
+    { name: 'token', type: 'address' },
+    { name: 'amount', type: 'uint256' },
+  ],
+  Witness: [
+    { name: 'to', type: 'address' },
+    { name: 'facilitator', type: 'address' },
+    { name: 'validAfter', type: 'uint256' },
+  ],
+  PermitWitnessTransferFrom: [
+    { name: 'permitted', type: 'TokenPermissions' },
+    { name: 'spender', type: 'address' },
+    { name: 'nonce', type: 'uint256' },
+    { name: 'deadline', type: 'uint256' },
+    { name: 'witness', type: 'Witness' },
+  ],
+} as const;
+
+/**
+ * Sign a Permit2 `PermitWitnessTransferFrom` typed data message for the upto
+ * scheme using the caller's private key.
+ *
+ * The signed message authorises a USDC transfer of up to `accepted.amount` to
+ * `accepted.payTo`, settled by the facilitator specified in the 402 response
+ * (`accepted.extra.facilitatorAddress`). The actual settlement amount is
+ * determined post-execution and may be ≤ the authorised ceiling.
+ *
+ * @returns A `PaymentPayload` with `permit2Authorization` (signature included).
+ */
+export async function signPermit2(
+  privateKey: `0x${string}`,
+  accepted: X402Accept,
+  from: `0x${string}`,
+  opts?: { validForSec?: number },
+): Promise<PaymentPayload> {
+  const account: PrivateKeyAccount = privateKeyToAccount(privateKey);
+  const validForSec = opts?.validForSec ?? 3600;
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  const facilitatorAddress =
+    (accepted.extra?.facilitatorAddress as string) ??
+    '0x8f5cb67b49555e614892b7233cfddebfb746e531';
+
+  // Generate a random uint256 nonce (Permit2 uses a bitmap; random avoids
+  // collisions across concurrent signers).
+  const nonceBytes = randomBytes(32);
+  const nonceBigInt = BigInt(`0x${nonceBytes.toString('hex')}`);
+
+  const message = {
+    permitted: {
+      token: accepted.asset as `0x${string}`,
+      amount: BigInt(accepted.amount),
+    },
+    spender: PERMIT2_SPENDER as `0x${string}`,
+    nonce: nonceBigInt,
+    deadline: BigInt(nowSec + validForSec),
+    witness: {
+      to: accepted.payTo as `0x${string}`,
+      facilitator: facilitatorAddress as `0x${string}`,
+      validAfter: 0n,
+    },
+  } as const;
+
+  const signature = await account.signTypedData({
+    domain: PERMIT2_DOMAIN,
+    types: PERMIT2_TYPES,
+    primaryType: 'PermitWitnessTransferFrom',
+    message,
+  });
+
+  return {
+    permit2Authorization: {
+      permitted: {
+        token: accepted.asset,
+        amount: accepted.amount,
+      },
+      spender: PERMIT2_SPENDER,
+      nonce: nonceBigInt.toString(),
+      deadline: String(nowSec + validForSec),
+      witness: {
+        to: accepted.payTo,
+        facilitator: facilitatorAddress,
+        validAfter: '0',
+      },
+      signature,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 4. buildPaymentHeader
 // ---------------------------------------------------------------------------
 
@@ -272,7 +373,7 @@ export function buildPaymentHeader(
  *
  * Flow:
  * 1. POST without payment → expect HTTP 402 with quote.
- * 2. Pick an accept entry and sign an EIP-3009 authorization.
+ * 2. Pick an accept entry and sign an authorization (Permit2 or EIP-3009).
  * 3. Re-send the original request with a `PAYMENT-SIGNATURE` header.
  * 4. If the response is still 402 → throw `PaymentError`.
  * 5. If the response is SSE (`text/event-stream`) → stream and accumulate.
@@ -296,12 +397,20 @@ export async function paidChatCompletion(
   // Step 2 — pick the first accepted payment method.
   const accepted = pickFirstAccept(quote.accepts);
 
-  // Step 3 — sign the EIP-3009 TransferWithAuthorization.
+  // Step 3 — sign the authorization.
+  // Permit2 (upto scheme) when the server advertises assetTransferMethod=permit2;
+  // EIP-3009 otherwise (exact scheme or legacy upto without Permit2).
   const account = privateKeyToAccount(privateKey);
   const from = account.address;
-  const payload = await signEip3009(privateKey, accepted, from, {
-    validForSec: opts?.validForSec,
-  });
+  const assetTransferMethod = accepted.extra?.assetTransferMethod;
+  const payload =
+    assetTransferMethod === 'permit2'
+      ? await signPermit2(privateKey, accepted, from, {
+          validForSec: opts?.validForSec,
+        })
+      : await signEip3009(privateKey, accepted, from, {
+          validForSec: opts?.validForSec,
+        });
 
   // Step 4 — build the PAYMENT-SIGNATURE header.
   const paymentHeader = buildPaymentHeader(

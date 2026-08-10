@@ -113,14 +113,16 @@ You can import it into MetaMask or any EVM wallet for self-management:
 Each paid LLM call follows the x402 micropayment protocol:
 
 1. **402 Quote** — POST without payment → server responds with HTTP 402 + payment details (price, recipient, network)
-2. **EIP-3009 Signature** — Sign a `TransferWithAuthorization` typed data message authorizing the USDC transfer
+2. **Authorization Signature** — Sign a typed data message authorizing the USDC transfer:
+   - **Permit2** (`upto` scheme with `assetTransferMethod=permit2`) — sign a `PermitWitnessTransferFrom` authorising a ceiling amount; the server settles only the actual cost post-execution (≤ ceiling)
+   - **EIP-3009** (`exact` scheme or legacy `upto`) — sign a `TransferWithAuthorization` for the exact amount
 3. **PAYMENT-SIGNATURE** — Re-send the request with a base64-encoded `PAYMENT-SIGNATURE` header containing the signed authorization
 4. **SSE Stream** — Server verifies the signature and streams the LLM response via Server-Sent Events
 
 ## Security
 
 - **Private keys** are stored at `~/.token4u-mcp/wallet.json` with `0o600` permissions
-- Private keys **never leave** this machine — all EIP-3009 signing happens locally
+- Private keys **never leave** this machine — all EIP-3009 and Permit2 signing happens locally
 - No token4u account required — the MCP server manages its own local wallet
 - All payments are on-chain USDC transfers on Base network
 
