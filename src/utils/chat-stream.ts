@@ -1,10 +1,10 @@
+import type { Usage } from '../types.js';
+
 export interface StreamResult {
   content: string;
-  usage?: {
-    promptTokens?: number;
-    completionTokens?: number;
-    totalTokens?: number;
-  };
+  /** Accumulated reasoning_content from GLM/DeepSeek-style deltas. */
+  reasoningContent?: string;
+  usage?: Usage;
   sessionId?: string;
   model?: string;
 }
@@ -12,6 +12,7 @@ export interface StreamResult {
 export type DeltaCallback = (delta: {
   content: string;
   reasoning?: string;
+  reasoningContent?: string;
   finishReason?: string;
 }) => void;
 
@@ -37,6 +38,7 @@ export async function streamChatCompletion(
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let content = '';
+  let reasoningContent = '';
   let usage: StreamResult['usage'] | undefined;
   let sessionId: string | undefined;
   let model: string | undefined;
@@ -124,6 +126,10 @@ export async function streamChatCompletion(
           typeof delta.reasoning === 'string'
             ? delta.reasoning
             : undefined;
+        const reasoningContentDelta =
+          typeof delta.reasoning_content === 'string'
+            ? delta.reasoning_content
+            : undefined;
         const finishReason =
           typeof choice.finish_reason === 'string'
             ? choice.finish_reason
@@ -133,8 +139,17 @@ export async function streamChatCompletion(
           content += text;
         }
 
+        if (reasoningContentDelta) {
+          reasoningContent += reasoningContentDelta;
+        }
+
         if (onDelta) {
-          onDelta({ content: text, reasoning, finishReason });
+          onDelta({
+            content: text,
+            reasoning,
+            reasoningContent: reasoningContentDelta,
+            finishReason,
+          });
         }
       }
 
@@ -164,10 +179,16 @@ export async function streamChatCompletion(
     }
   }
 
-  return { content, usage, sessionId, model };
+  return {
+    content,
+    reasoningContent: reasoningContent || undefined,
+    usage,
+    sessionId,
+    model,
+  };
 }
 
-function normalizeUsage(raw: Record<string, unknown>): StreamResult['usage'] {
+export function normalizeUsage(raw: Record<string, unknown>): Usage | undefined {
   const promptTokens =
     typeof raw.prompt_tokens === 'number' ? raw.prompt_tokens : undefined;
   const completionTokens =
@@ -177,9 +198,34 @@ function normalizeUsage(raw: Record<string, unknown>): StreamResult['usage'] {
   const totalTokens =
     typeof raw.total_tokens === 'number' ? raw.total_tokens : undefined;
 
-  if (promptTokens === undefined && completionTokens === undefined && totalTokens === undefined) {
+  // Extract cache fields from prompt_tokens_details (OpenAI/GLM/DeepSeek).
+  const details = raw.prompt_tokens_details as
+    | Record<string, unknown>
+    | undefined;
+  const cachedTokens =
+    typeof details?.cached_tokens === 'number'
+      ? details.cached_tokens
+      : undefined;
+  const cacheCreationTokens =
+    typeof details?.cached_creation_tokens === 'number'
+      ? details.cached_creation_tokens
+      : undefined;
+
+  if (
+    promptTokens === undefined &&
+    completionTokens === undefined &&
+    totalTokens === undefined &&
+    cachedTokens === undefined &&
+    cacheCreationTokens === undefined
+  ) {
     return undefined;
   }
 
-  return { promptTokens, completionTokens, totalTokens };
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens,
+    cachedTokens,
+    cacheCreationTokens,
+  };
 }

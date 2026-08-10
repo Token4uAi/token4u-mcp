@@ -10,7 +10,7 @@ import {
   PERMIT2_SPENDER,
 } from '../config.js';
 import type { Permit2Authorization as Permit2Auth } from '../types.js';
-import { streamChatCompletion } from './chat-stream.js';
+import { streamChatCompletion, normalizeUsage } from './chat-stream.js';
 import type { StreamResult } from './chat-stream.js';
 
 // ---------------------------------------------------------------------------
@@ -464,24 +464,7 @@ export async function paidChatCompletion(
       content,
       model: typeof json.model === 'string' ? json.model : undefined,
       usage: json.usage
-        ? {
-            promptTokens:
-              typeof (json.usage as Record<string, unknown>).prompt_tokens ===
-              'number'
-                ? (json.usage as Record<string, unknown>).prompt_tokens as number
-                : undefined,
-            completionTokens:
-              typeof (json.usage as Record<string, unknown>)
-                .completion_tokens === 'number'
-                ? (json.usage as Record<string, unknown>)
-                    .completion_tokens as number
-                : undefined,
-            totalTokens:
-              typeof (json.usage as Record<string, unknown>).total_tokens ===
-              'number'
-                ? (json.usage as Record<string, unknown>).total_tokens as number
-                : undefined,
-          }
+        ? normalizeUsage(json.usage as Record<string, unknown>)
         : undefined,
       sessionId:
         typeof json.session_id === 'string'

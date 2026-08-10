@@ -12,6 +12,20 @@ export interface AgentBudget {
 }
 
 // ---------------------------------------------------------------------------
+// Usage (token counts + cache)
+// ---------------------------------------------------------------------------
+
+export interface Usage {
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+  /** Tokens read from cache (prompt_tokens_details.cached_tokens). */
+  cachedTokens?: number;
+  /** Tokens written to cache (prompt_tokens_details.cached_creation_tokens). */
+  cacheCreationTokens?: number;
+}
+
+// ---------------------------------------------------------------------------
 // Permit2 types (upto scheme)
 // ---------------------------------------------------------------------------
 
