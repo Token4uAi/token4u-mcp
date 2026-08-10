@@ -62,6 +62,8 @@ interface PaymentHeaderObject {
 
 export interface PaidChatResult {
   content: string;
+  /** Accumulated reasoning_content from GLM/DeepSeek-style deltas. */
+  reasoningContent?: string;
   model?: string;
   /** Amount paid in USD (6-decimal USDC amount converted to dollars). */
   paidUsd: number;
@@ -462,6 +464,12 @@ export async function paidChatCompletion(
 
     streamResult = {
       content,
+      reasoningContent: (() => {
+        const msg = (json.choices as Array<{ message?: Record<string, unknown> }> | undefined)?.[0]?.message;
+        if (msg && typeof msg.reasoning_content === 'string') return msg.reasoning_content;
+        if (msg && typeof msg.reasoning === 'string') return msg.reasoning;
+        return undefined;
+      })(),
       model: typeof json.model === 'string' ? json.model : undefined,
       usage: json.usage
         ? normalizeUsage(json.usage as Record<string, unknown>)
@@ -484,6 +492,7 @@ export async function paidChatCompletion(
 
   return {
     content: streamResult.content,
+    reasoningContent: streamResult.reasoningContent,
     model: streamResult.model,
     paidUsd,
     sessionId,
