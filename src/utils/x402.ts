@@ -319,6 +319,7 @@ export async function signPermit2(
 
   return {
     permit2Authorization: {
+      from: from,
       permitted: {
         token: accepted.asset,
         amount: accepted.amount,

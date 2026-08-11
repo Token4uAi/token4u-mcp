@@ -36,6 +36,8 @@ export interface Permit2Witness {
 }
 
 export interface Permit2Authorization {
+  /** Signer address (the wallet that signed the permit). */
+  from: `0x${string}`;
   permitted: {
     token: string;
     amount: string;
