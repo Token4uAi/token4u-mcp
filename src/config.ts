@@ -21,12 +21,28 @@ export const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 
 export const BASE_CHAIN_ID = 8453;
 
+/** Base RPC URL for on-chain allowance / nonce checks (eth_call). */
+export const BASE_RPC_URL =
+  process.env.BASE_RPC_URL ?? 'https://mainnet.base.org';
+
 export const EIP3009_DOMAIN = {
   name: 'USD Coin',
   version: '2',
   chainId: 8453,
   verifyingContract: USDC_BASE,
 };
+
+// ---------------------------------------------------------------------------
+// EIP-2612 domain (USDC on Base — shared with EIP-3009 above)
+// ---------------------------------------------------------------------------
+
+/** EIP-712 domain for USDC EIP-2612 permit on Base. */
+export const USDC_EIP2612_DOMAIN = {
+  name: 'USD Coin',
+  version: '2',
+  chainId: 8453,
+  verifyingContract: USDC_BASE,
+} as const;
 
 // ---------------------------------------------------------------------------
 // Permit2 constants (upto scheme)
@@ -45,4 +61,48 @@ export const PERMIT2_DOMAIN = {
   name: 'Permit2',
   chainId: 8453,
   verifyingContract: PERMIT2_CONTRACT,
+} as const;
+
+// ---------------------------------------------------------------------------
+// ABIs for on-chain reads (eth_call)
+// ---------------------------------------------------------------------------
+
+/** ERC-20 allowance(address,address) → uint256 ABI. */
+export const ERC20_ALLOWANCE_ABI = [
+  {
+    type: 'function',
+    name: 'allowance',
+    inputs: [
+      { name: 'owner', type: 'address' },
+      { name: 'spender', type: 'address' },
+    ],
+    outputs: [{ type: 'uint256' }],
+    stateMutability: 'view',
+  },
+] as const;
+
+/** EIP-2612 nonces(address) → uint256 ABI. */
+export const USDC_NONCES_ABI = [
+  {
+    type: 'function',
+    name: 'nonces',
+    inputs: [{ name: 'owner', type: 'address' }],
+    outputs: [{ type: 'uint256' }],
+    stateMutability: 'view',
+  },
+] as const;
+
+// ---------------------------------------------------------------------------
+// EIP-2612 Permit typed-data types
+// ---------------------------------------------------------------------------
+
+/** EIP-2612 Permit(address owner, address spender, uint256 value, uint256 nonce, uint256 deadline). */
+export const EIP2612_PERMIT_TYPES = {
+  Permit: [
+    { name: 'owner', type: 'address' },
+    { name: 'spender', type: 'address' },
+    { name: 'value', type: 'uint256' },
+    { name: 'nonce', type: 'uint256' },
+    { name: 'deadline', type: 'uint256' },
+  ],
 } as const;

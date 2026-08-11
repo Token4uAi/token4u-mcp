@@ -2,14 +2,31 @@ import { randomBytes } from 'node:crypto';
 
 import { privateKeyToAccount } from 'viem/accounts';
 import type { PrivateKeyAccount } from 'viem/accounts';
+import {
+  createPublicClient,
+  http,
+  encodeFunctionData,
+  decodeFunctionResult,
+} from 'viem';
 
 import {
   USDC_BASE,
   EIP3009_DOMAIN,
   PERMIT2_DOMAIN,
   PERMIT2_SPENDER,
+  PERMIT2_CONTRACT,
+  BASE_RPC_URL,
+  USDC_EIP2612_DOMAIN,
+  EIP2612_PERMIT_TYPES,
+  ERC20_ALLOWANCE_ABI,
+  USDC_NONCES_ABI,
 } from '../config.js';
 import type { Permit2Authorization as Permit2Auth } from '../types.js';
+import {
+  EIP2612_GAS_SPONSORING_KEY,
+  ERC20_APPROVAL_GAS_SPONSORING_KEY,
+} from '../types.js';
+import type { Eip2612PermitInfo } from '../types.js';
 import { streamChatCompletion, normalizeUsage } from './chat-stream.js';
 import type { StreamResult } from './chat-stream.js';
 
@@ -46,6 +63,8 @@ export interface PaymentPayload {
   authorization?: Eip3009Authorization;
   signature?: `0x${string}`;
   permit2Authorization?: Permit2Auth;
+  /** Gas sponsoring extensions (e.g. EIP-2612 permit for gasless approve). */
+  __extensions?: Record<string, unknown>;
 }
 
 interface PaymentHeaderObject {
@@ -58,6 +77,8 @@ interface PaymentHeaderObject {
   };
   accepted: X402Accept;
   payload: PaymentPayload;
+  /** Gas-sponsoring extensions at paymentPayload level (CDP reads payload.extensions). */
+  extensions?: Record<string, unknown>;
 }
 
 export interface PaidChatResult {
@@ -338,6 +359,156 @@ export async function signPermit2(
 }
 
 // ---------------------------------------------------------------------------
+// 3c. Gas sponsoring extensions — allowance check + EIP-2612 permit + CDP hint
+// ---------------------------------------------------------------------------
+
+/** Lazy-initialised viem PublicClient for on-chain eth_call reads. */
+let _publicClient: ReturnType<typeof createPublicClient> | null = null;
+
+function getPublicClient(): ReturnType<typeof createPublicClient> {
+  if (!_publicClient) {
+    _publicClient = createPublicClient({
+      transport: http(BASE_RPC_URL),
+    });
+  }
+  return _publicClient;
+}
+
+/** Detected gas-sponsoring extensions from a quote accept entry. */
+export interface GasSponsoringExtensions {
+  eip2612GasSponsoring: boolean;
+  erc20ApprovalGasSponsoring: boolean;
+}
+
+/**
+ * Detect which gas-sponsoring extensions are advertised in the 402 quote.
+ *
+ * The server declares extensions in `accept.extra` — e.g.
+ * `extra.erc20ApprovalGasSponsoring` or `extra.eip2612GasSponsoring`.
+ */
+export function detectGasSponsoringExtensions(
+  accepted: X402Accept,
+): GasSponsoringExtensions {
+  const extra = accepted.extra ?? {};
+  return {
+    eip2612GasSponsoring: extra[EIP2612_GAS_SPONSORING_KEY] !== undefined,
+    erc20ApprovalGasSponsoring:
+      extra[ERC20_APPROVAL_GAS_SPONSORING_KEY] !== undefined,
+  };
+}
+
+/**
+ * Check whether the wallet has sufficient USDC allowance for the Permit2
+ * canonical contract via an on-chain `eth_call`.
+ *
+ * @returns `true` when `allowance(owner, PERMIT2) >= amount`, or when the
+ *          RPC call fails (fail-open to avoid blocking legitimate payments).
+ */
+export async function checkAllowance(
+  owner: `0x${string}`,
+  amount: string,
+): Promise<boolean> {
+  try {
+    const client = getPublicClient();
+    const data = encodeFunctionData({
+      abi: ERC20_ALLOWANCE_ABI,
+      functionName: 'allowance',
+      args: [owner, PERMIT2_CONTRACT as `0x${string}`],
+    });
+
+    const result = await client.call({
+      to: USDC_BASE as `0x${string}`,
+      data,
+    });
+
+    if (!result.data) return false;
+
+    const allowance = decodeFunctionResult({
+      abi: ERC20_ALLOWANCE_ABI,
+      functionName: 'allowance',
+      data: result.data,
+    });
+
+    return (allowance as bigint) >= BigInt(amount);
+  } catch {
+    // Fail open: on RPC issues, assume allowance is sufficient to avoid
+    // blocking a legitimate payment flow.
+    return true;
+  }
+}
+
+/**
+ * Sign an EIP-2612 permit authorising Permit2 to spend USDC on behalf of the
+ * wallet owner.  This is the gasless-approve path — the permit signature is
+ * attached to the payment payload so the server/facilitator can submit the
+ * `permit()` + `settle` atomically.
+ */
+export async function signEip2612Permit(
+  privateKey: `0x${string}`,
+  accepted: X402Accept,
+  from: `0x${string}`,
+  opts?: { validForSec?: number },
+): Promise<Eip2612PermitInfo> {
+  const account: PrivateKeyAccount = privateKeyToAccount(privateKey);
+  const validForSec = opts?.validForSec ?? 3600;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const deadline = String(nowSec + validForSec);
+
+  // Fetch the current EIP-2612 nonce from the USDC contract.
+  let nonce = '0';
+  try {
+    const client = getPublicClient();
+    const data = encodeFunctionData({
+      abi: USDC_NONCES_ABI,
+      functionName: 'nonces',
+      args: [from],
+    });
+    const result = await client.call({
+      to: USDC_BASE as `0x${string}`,
+      data,
+    });
+    if (result.data) {
+      nonce = String(
+        decodeFunctionResult({
+          abi: USDC_NONCES_ABI,
+          functionName: 'nonces',
+          data: result.data,
+        }) as bigint,
+      );
+    }
+  } catch {
+    // Nonce fetch failed — fall back to 0.  The on-chain permit will reject
+    // if the nonce is wrong, but the user can retry.
+  }
+
+  const message = {
+    owner: from,
+    spender: PERMIT2_CONTRACT as `0x${string}`,
+    value: BigInt(accepted.amount),
+    nonce: BigInt(nonce),
+    deadline: BigInt(deadline),
+  };
+
+  const signature = await account.signTypedData({
+    domain: USDC_EIP2612_DOMAIN,
+    types: EIP2612_PERMIT_TYPES,
+    primaryType: 'Permit',
+    message,
+  });
+
+  return {
+    from,
+    asset: accepted.asset,
+    spender: PERMIT2_CONTRACT,
+    amount: accepted.amount,
+    nonce,
+    deadline,
+    signature,
+    version: '1',
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 4. buildPaymentHeader
 // ---------------------------------------------------------------------------
 
@@ -350,6 +521,7 @@ export function buildPaymentHeader(
   payload: PaymentPayload,
   resourceUrl: string,
   resourceDescription: string,
+  extensions?: Record<string, unknown>,
 ): string {
   const obj: PaymentHeaderObject = {
     x402Version: 2,
@@ -361,6 +533,7 @@ export function buildPaymentHeader(
     },
     accepted,
     payload,
+    extensions,
   };
 
   return Buffer.from(JSON.stringify(obj)).toString('base64');
@@ -376,11 +549,14 @@ export function buildPaymentHeader(
  *
  * Flow:
  * 1. POST without payment → expect HTTP 402 with quote.
- * 2. Pick an accept entry and sign an authorization (Permit2 or EIP-3009).
- * 3. Re-send the original request with a `PAYMENT-SIGNATURE` header.
- * 4. If the response is still 402 → throw `PaymentError`.
- * 5. If the response is SSE (`text/event-stream`) → stream and accumulate.
- * 6. Otherwise parse as plain JSON.
+ * 2. Pick an accept entry, detect gas-sponsoring extensions, check allowance.
+ * 3. If allowance is insufficient and EIP-2612 is available → sign a gasless
+ *    permit; otherwise show a descriptive error (CDP sponsoring / manual approve).
+ * 4. Sign the payment authorization (Permit2 or EIP-3009).
+ * 5. Re-send the original request with a `PAYMENT-SIGNATURE` header.
+ * 6. If the response is still 402 → throw `PaymentError`.
+ * 7. If the response is SSE (`text/event-stream`) → stream and accumulate.
+ * 8. Otherwise parse as plain JSON.
  *
  * @returns The accumulated content, model name, amount paid in USD, and
  *          optional session / usage metadata.
@@ -400,13 +576,77 @@ export async function paidChatCompletion(
   // Step 2 — pick the first accepted payment method.
   const accepted = pickFirstAccept(quote.accepts);
 
+  // Resolve the signer account.
+  const account = privateKeyToAccount(privateKey);
+  const from = account.address;
+  const assetTransferMethod = accepted.extra?.assetTransferMethod;
+
+  // -----------------------------------------------------------------------
+  // Step 2b — gasless approve check (Permit2 only).
+  //
+  // Permit2 requires the user to have approved USDC for the canonical
+  // Permit2 contract.  If the allowance is insufficient the server will
+  // reject with `permit2_allowance_required`.  We check ahead of time so
+  // we can attach a gasless EIP-2612 permit (or show a helpful error).
+  // -----------------------------------------------------------------------
+  let __extensions: Record<string, unknown> | undefined;
+
+  if (assetTransferMethod === 'permit2') {
+    // Detect which gas-sponsoring extensions the server advertises.
+
+    const hasAllowance = await checkAllowance(from, accepted.amount);
+    if (!hasAllowance) {
+      // T83b: USDC (Base) supports EIP-2612 natively — always try the gasless
+      // permit path regardless of server extension advertisement. The CDP
+      // facilitator accepts the EIP-2612 permit extension and submits
+      // permit() + settle atomically (0 gas for the buyer).
+      try {
+        const eip2612Info = await signEip2612Permit(
+          privateKey,
+          accepted,
+          from,
+          { validForSec: opts?.validForSec },
+        );
+        __extensions = {
+          [EIP2612_GAS_SPONSORING_KEY]: { info: eip2612Info },
+        };
+      } catch (permitErr) {
+        // EIP-2612 not supported by this token — fall back to server
+        // extensions or a manual-approve hint.
+        const gasExtensions = detectGasSponsoringExtensions(accepted);
+        if (gasExtensions.erc20ApprovalGasSponsoring) {
+          // TODO(T83): Implement CDP gas sponsoring via signed_transaction.
+          // The server declares erc20ApprovalGasSponsoring but the client-side
+          // signed-transaction flow is not yet wired up. For now, surface a
+          // clear error so the user can manually approve.
+          throw new PaymentError(
+            `Insufficient USDC allowance for Permit2 (${PERMIT2_CONTRACT}).\n` +
+              `EIP-2612 permit failed: ${(permitErr as Error).message}\n` +
+              `The server supports CDP gas sponsoring (erc20ApprovalGasSponsoring) ` +
+              `but this client does not yet implement signed-transaction submission.\n\n` +
+              `Workaround: manually call USDC.approve(${PERMIT2_CONTRACT}, amount) ` +
+              `on Base before retrying.\n` +
+              `Permit2 canonical: ${PERMIT2_CONTRACT}`,
+          );
+        } else {
+          // No gas-sponsoring extension — user must manually approve.
+          throw new PaymentError(
+            `Insufficient USDC allowance for Permit2 (${PERMIT2_CONTRACT}).\n` +
+              `EIP-2612 permit failed: ${(permitErr as Error).message}\n` +
+              `No gas-sponsoring extension advertised by the server.\n\n` +
+              `Please manually call USDC.approve(${PERMIT2_CONTRACT}, amount) ` +
+              `on Base before retrying.\n` +
+              `Permit2 canonical: ${PERMIT2_CONTRACT}`,
+          );
+        }
+      }
+    }
+  }
+
   // Step 3 — sign the authorization.
   // Permit2 (upto scheme) is the only accepted method on token4u live
   // (X402_ASSET_TRANSFER_METHOD=permit2). Sign Permit2; if the server still
   // advertises EIP-3009 (legacy), fall back to it for backward compatibility.
-  const account = privateKeyToAccount(privateKey);
-  const from = account.address;
-  const assetTransferMethod = accepted.extra?.assetTransferMethod;
   const payload =
     assetTransferMethod === 'permit2'
       ? await signPermit2(privateKey, accepted, from, {
@@ -416,12 +656,17 @@ export async function paidChatCompletion(
           validForSec: opts?.validForSec,
         });
 
+  // Attach gas-sponsoring extensions at paymentPayload level (CDP reads
+  // payload.extensions — e.g. EIP-2612 permit for gasless approve).
+  const extensions = __extensions;
+
   // Step 4 — build the PAYMENT-SIGNATURE header.
   const paymentHeader = buildPaymentHeader(
     accepted,
     payload,
     resourceUrl,
     resourceDescription,
+    extensions,
   );
 
   // Step 5 — re-send the request with payment.

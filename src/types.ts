@@ -48,3 +48,25 @@ export interface Permit2Authorization {
   witness: Permit2Witness;
   signature: `0x${string}`;
 }
+
+// ---------------------------------------------------------------------------
+// Gas sponsoring extensions (x402 CDP gasless approve)
+// ---------------------------------------------------------------------------
+
+/** Extension key for EIP-2612 gas sponsoring. */
+export const EIP2612_GAS_SPONSORING_KEY = 'eip2612GasSponsoring';
+
+/** Extension key for ERC-20 approval gas sponsoring (CDP). */
+export const ERC20_APPROVAL_GAS_SPONSORING_KEY = 'erc20ApprovalGasSponsoring';
+
+/** EIP-2612 permit data sent by the client for gasless Permit2 approval. */
+export interface Eip2612PermitInfo {
+  from: string;
+  asset: string;
+  spender: string;
+  amount: string;
+  nonce: string;
+  deadline: string;
+  signature: `0x${string}`;
+  version: string;
+}
