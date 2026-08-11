@@ -413,6 +413,8 @@ export async function checkAllowance(
     const data = encodeFunctionData({
       abi: ERC20_ALLOWANCE_ABI,
       functionName: 'allowance',
+      // T83d-fix: CDP consumes the 0x0000 (Permit2 contract) allowance via
+      // settleWithPermit — check against PERMIT2_CONTRACT.
       args: [owner, PERMIT2_CONTRACT as `0x${string}`],
     });
 
@@ -483,6 +485,9 @@ export async function signEip2612Permit(
 
   const message = {
     owner: from,
+    // CDP validates eip2612_info.spender == PERMIT2_ADDRESS (0x0000) and
+    // settleWithPermit consumes that allowance. amount must match the
+    // settlement amount — max uint256 fails CDP simulation (T83c reverted).
     spender: PERMIT2_CONTRACT as `0x${string}`,
     value: BigInt(accepted.amount),
     nonce: BigInt(nonce),
