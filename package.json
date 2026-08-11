@@ -1,6 +1,6 @@
 {
   "name": "token4u-mcp",
-  "version": "0.3.9",
+  "version": "0.3.10",
   "type": "module",
   "description": "Token4u MCP Server - x402 micropayments for AI agents. Wallet management, USDC top-up, x402 paid LLM calls.",
   "bin": {
