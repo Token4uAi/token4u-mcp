@@ -96,6 +96,8 @@ export interface PaidChatOptions {
   timeoutMs?: number;
   validForSec?: number;
   resourceDescription?: string;
+  /** Max payment attempts for transient permit/allowance failures (default 3). */
+  maxPaymentAttempts?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +447,107 @@ export async function checkAllowance(
  * attached to the payment payload so the server/facilitator can submit the
  * `permit()` + `settle` atomically.
  */
+
+// Module-level monotonic permit nonce tracker (per process). Prevents
+// consecutive gasless permits from reusing a nonce while the chain read is
+// stale (e.g. the previous permit's settle tx hasn't been mined yet).
+let _lastPermitNonce = -1n;
+let _permitNonceLock: Promise<void> | null = null;
+
+function _nextPermitNonce(): bigint {
+  return _lastPermitNonce + 1n;
+}
+
+async function _withPermitNonceLock<T>(fn: () => Promise<T>): Promise<T> {
+  while (_permitNonceLock) {
+    await _permitNonceLock;
+  }
+  let release!: () => void;
+  _permitNonceLock = new Promise((res) => (release = res));
+  try {
+    return await fn();
+  } finally {
+    _permitNonceLock = null;
+    release();
+  }
+}
+
+/**
+ * Sign an ERC-20 approve(Permit2, MaxUint256) transaction for CDP gas
+ * sponsoring (erc20ApprovalGasSponsoring). The signed tx is attached to the
+ * payload — CDP broadcasts it (covering gas) so the buyer's allowance becomes
+ * permanent and subsequent payments skip the permit entirely.
+ */
+export async function signErc20ApprovalTransaction(
+  privateKey: `0x${string}`,
+  from: `0x${string}`,
+  chainId = 8453,
+): Promise<{
+  from: string;
+  asset: string;
+  spender: string;
+  amount: string;
+  signedTransaction: `0x${string}`;
+  version: string;
+}> {
+  const account: PrivateKeyAccount = privateKeyToAccount(privateKey);
+  const maxUint256 =
+    '0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
+
+  const nonce = await getPublicClient().getTransactionCount({
+    address: from,
+  });
+
+  // Use realistic fees — CDP broadcasts this raw tx, so it must be payable
+  // at the current Base gas price (a too-low price fails the simulation).
+  let maxFeePerGas = 10_000_000_000n; // 10 gwei default
+  let maxPriorityFeePerGas = 100_000_000n; // 0.1 gwei tip default
+  try {
+    const fees = await getPublicClient().estimateFeesPerGas();
+    if (fees.maxFeePerGas) maxFeePerGas = fees.maxFeePerGas;
+    if (fees.maxPriorityFeePerGas) maxPriorityFeePerGas = fees.maxPriorityFeePerGas;
+  } catch {
+    // keep defaults
+  }
+
+  const tx = {
+    to: USDC_BASE as `0x${string}`,
+    data: encodeFunctionData({
+      abi: [
+        {
+          type: 'function',
+          name: 'approve',
+          inputs: [
+            { name: 'spender', type: 'address' },
+            { name: 'amount', type: 'uint256' },
+          ],
+          outputs: [{ name: '', type: 'bool' }],
+        },
+      ] as const,
+      functionName: 'approve',
+      args: [PERMIT2_CONTRACT as `0x${string}`, BigInt(maxUint256)],
+    }),
+    nonce,
+    gas: 100_000n,
+    maxFeePerGas,
+    maxPriorityFeePerGas,
+    chainId: chainId as number,
+  } as const;
+
+  const signed = await account.signTransaction(
+    tx as unknown as Parameters<typeof account.signTransaction>[0],
+  );
+
+  return {
+    from,
+    asset: USDC_BASE,
+    spender: PERMIT2_CONTRACT,
+    amount: maxUint256,
+    signedTransaction: signed,
+    version: '1',
+  };
+}
+
 export async function signEip2612Permit(
   privateKey: `0x${string}`,
   accepted: X402Accept,
@@ -456,32 +559,43 @@ export async function signEip2612Permit(
   const nowSec = Math.floor(Date.now() / 1000);
   const deadline = String(nowSec + validForSec);
 
-  // Fetch the current EIP-2612 nonce from the USDC contract.
-  let nonce = '0';
-  try {
-    const client = getPublicClient();
-    const data = encodeFunctionData({
-      abi: USDC_NONCES_ABI,
-      functionName: 'nonces',
-      args: [from],
-    });
-    const result = await client.call({
-      to: USDC_BASE as `0x${string}`,
-      data,
-    });
-    if (result.data) {
-      nonce = String(
-        decodeFunctionResult({
-          abi: USDC_NONCES_ABI,
-          functionName: 'nonces',
-          data: result.data,
-        }) as bigint,
-      );
+  // Fetch the current EIP-2612 nonce from the USDC contract under a lock so
+  // concurrent calls never read the same nonce before the previous permit is
+  // consumed on-chain. USDC permit requires nonce == current on-chain nonce.
+  const nonce = await _withPermitNonceLock(async () => {
+    try {
+      const client = getPublicClient();
+      const data = encodeFunctionData({
+        abi: USDC_NONCES_ABI,
+        functionName: 'nonces',
+        args: [from],
+      });
+      const result = await client.call({
+        to: USDC_BASE as `0x${string}`,
+        data,
+      });
+      if (result.data) {
+        const chainNonce = BigInt(
+          String(
+            decodeFunctionResult({
+              abi: USDC_NONCES_ABI,
+              functionName: 'nonces',
+              data: result.data,
+            }) as bigint,
+          ),
+        );
+        // T83e: ALWAYS use the fresh chain nonce. The previous permit is
+        // consumed by the settle tx (bumping on-chain nonce) — re-reading
+        // here guarantees correctness. Only fall back to local counter if
+        // the chain read fails.
+        return String(chainNonce);
+      }
+    } catch {
+      // fall through to local counter
     }
-  } catch {
-    // Nonce fetch failed — fall back to 0.  The on-chain permit will reject
-    // if the nonce is wrong, but the user can retry.
-  }
+    _lastPermitNonce = _lastPermitNonce + 1n;
+    return String(_lastPermitNonce);
+  });
 
   const message = {
     owner: from,
@@ -572,6 +686,43 @@ export async function paidChatCompletion(
   privateKey: `0x${string}`,
   opts?: PaidChatOptions,
 ): Promise<PaidChatResult> {
+  const maxAttempts = opts?.maxPaymentAttempts ?? 3;
+  let lastErr: Error | null = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await _paidChatCompletionOnce(baseUrl, body, privateKey, opts);
+    } catch (err) {
+      lastErr = err as Error;
+      const msg = (err as Error).message || '';
+      // PaymentError carries the server 402 body in `body` (third ctor arg).
+      const body =
+        err instanceof PaymentError && 'body' in err
+          ? String((err as unknown as { body?: unknown }).body ?? '')
+          : '';
+      const combined = msg + ' ' + body;
+      // Retry only on transient permit/allowance failures (the previous
+      // permit's settle tx may not be mined yet — re-read the nonce).
+      const retryable =
+        combined.includes('allowance_required') ||
+        combined.includes('Permit2') ||
+        combined.includes('signature') ||
+        combined.includes('simulation');
+      if (!retryable || attempt >= maxAttempts) break;
+      // Wait for the previous permit's settle tx to be mined (USDC permit
+      // nonce must equal the current on-chain nonce — a 10s wait lets the
+      // tx confirm so the re-read sees the bumped nonce).
+      await new Promise((r) => setTimeout(r, 10_000));
+    }
+  }
+  throw lastErr ?? new Error('paidChatCompletion failed');
+}
+
+async function _paidChatCompletionOnce(
+  baseUrl: string,
+  body: Record<string, unknown>,
+  privateKey: `0x${string}`,
+  opts?: PaidChatOptions,
+): Promise<PaidChatResult> {
   const resourceUrl = `${baseUrl}/v1/chat/completions`;
   const resourceDescription = opts?.resourceDescription ?? 'Chat completion';
 
@@ -601,10 +752,10 @@ export async function paidChatCompletion(
 
     const hasAllowance = await checkAllowance(from, accepted.amount);
     if (!hasAllowance) {
-      // T83b: USDC (Base) supports EIP-2612 natively — always try the gasless
-      // permit path regardless of server extension advertisement. The CDP
-      // facilitator accepts the EIP-2612 permit extension and submits
-      // permit() + settle atomically (0 gas for the buyer).
+      // T83e: prefer EIP-2612 permit — CDP validates it without requiring
+      // server-side extension registration (erc20ApprovalGasSponsoring needs
+      // the CDP operator to register the extension, which is not guaranteed).
+      // Retry with fresh chain nonce handles the consecutive-permit race.
       try {
         const eip2612Info = await signEip2612Permit(
           privateKey,
@@ -616,32 +767,30 @@ export async function paidChatCompletion(
           [EIP2612_GAS_SPONSORING_KEY]: { info: eip2612Info },
         };
       } catch (permitErr) {
-        // EIP-2612 not supported by this token — fall back to server
-        // extensions or a manual-approve hint.
         const gasExtensions = detectGasSponsoringExtensions(accepted);
         if (gasExtensions.erc20ApprovalGasSponsoring) {
-          // TODO(T83): Implement CDP gas sponsoring via signed_transaction.
-          // The server declares erc20ApprovalGasSponsoring but the client-side
-          // signed-transaction flow is not yet wired up. For now, surface a
-          // clear error so the user can manually approve.
-          throw new PaymentError(
-            `Insufficient USDC allowance for Permit2 (${PERMIT2_CONTRACT}).\n` +
-              `EIP-2612 permit failed: ${(permitErr as Error).message}\n` +
-              `The server supports CDP gas sponsoring (erc20ApprovalGasSponsoring) ` +
-              `but this client does not yet implement signed-transaction submission.\n\n` +
-              `Workaround: manually call USDC.approve(${PERMIT2_CONTRACT}, amount) ` +
-              `on Base before retrying.\n` +
-              `Permit2 canonical: ${PERMIT2_CONTRACT}`,
-          );
+          // Fallback: CDP gas-sponsored approve (permanent allowance).
+          try {
+            const approvalInfo = await signErc20ApprovalTransaction(
+              privateKey,
+              from,
+            );
+            __extensions = {
+              [ERC20_APPROVAL_GAS_SPONSORING_KEY]: { info: approvalInfo },
+            };
+          } catch (approvalErr) {
+            throw new PaymentError(
+              `Insufficient USDC allowance for Permit2 (${PERMIT2_CONTRACT}).\n` +
+                `EIP-2612 permit failed: ${(permitErr as Error).message}\n` +
+                `CDP approval sponsoring failed: ${(approvalErr as Error).message}\n` +
+                `Please manually call USDC.approve(${PERMIT2_CONTRACT}, MaxUint256) on Base.`,
+            );
+          }
         } else {
-          // No gas-sponsoring extension — user must manually approve.
           throw new PaymentError(
             `Insufficient USDC allowance for Permit2 (${PERMIT2_CONTRACT}).\n` +
               `EIP-2612 permit failed: ${(permitErr as Error).message}\n` +
-              `No gas-sponsoring extension advertised by the server.\n\n` +
-              `Please manually call USDC.approve(${PERMIT2_CONTRACT}, amount) ` +
-              `on Base before retrying.\n` +
-              `Permit2 canonical: ${PERMIT2_CONTRACT}`,
+              `Please manually call USDC.approve(${PERMIT2_CONTRACT}, amount) on Base.`,
           );
         }
       }
