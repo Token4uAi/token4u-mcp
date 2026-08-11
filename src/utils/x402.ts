@@ -848,6 +848,11 @@ async function _paidChatCompletionOnce(
   );
 
   // Step 5 — re-send the request with payment.
+  // T87d: force stream=true so the server's mid-flow token check (top-up 402)
+  // can interrupt long outputs. Non-streaming requests bypass the stream
+  // handler's token-limit logic, so long GLM/DS outputs were never billed
+  // past the floor (revenue loss).
+  const requestBody = { ...body, stream: true };
   const signal = AbortSignal.timeout(opts?.timeoutMs ?? 30_000);
   const res = await fetch(resourceUrl, {
     method: 'POST',
@@ -855,7 +860,7 @@ async function _paidChatCompletionOnce(
       'Content-Type': 'application/json',
       'PAYMENT-SIGNATURE': paymentHeader,
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(requestBody),
     signal,
   });
 
@@ -906,21 +911,138 @@ async function _paidChatCompletionOnce(
     };
   }
 
+  // -----------------------------------------------------------------------
+  // Step 7b — top-up loop (auto-resume on x402_top_up_required).
+  //
+  // Long outputs may exceed the initial payment ceiling.  The server sends
+  // an SSE event with error.type = "x402_top_up_required" and an
+  // x402_top_up payload.  We sign a new Permit2 covering the consumed +
+  // top-up amount, send a new POST with X-402-RESUME, and continue
+  // streaming, accumulating across all segments.
+  // -----------------------------------------------------------------------
+  const MAX_TOP_UPS = 5;
+  let topUpCount = 0;
+  let accumulatedContent = streamResult.content;
+  let accumulatedReasoning = streamResult.reasoningContent;
+  let accumulatedUsage = streamResult.usage;
+  let totalPaidUsd = Number(accepted.amount) / 1e6;
+
+  while (streamResult.topUp && topUpCount < MAX_TOP_UPS) {
+    topUpCount++;
+    const topUp = streamResult.topUp;
+
+    // New Permit2 ceiling = consumed so far + additional for next segment.
+    const newAmount = String(
+      BigInt(topUp.consumedAmount) + BigInt(topUp.topUpAmount),
+    );
+    const newAccepted: X402Accept = { ...accepted, amount: newAmount };
+
+    // Sign a fresh authorization for the updated ceiling.
+    const newPayload =
+      assetTransferMethod === 'permit2'
+        ? await signPermit2(privateKey, newAccepted, from, {
+            validForSec: opts?.validForSec,
+          })
+        : await signEip3009(privateKey, newAccepted, from, {
+            validForSec: opts?.validForSec,
+          });
+
+    // T88b: the gas-sponsoring extensions (EIP-2612 permit) must be RE-SIGNED
+    // for the top-up too — the original permit's nonce was consumed by the
+    // first segment's settle, so reusing it makes CDP reject the resume
+    // with allowance_required.
+    let resumeExtensions = extensions;
+    if (assetTransferMethod === 'permit2' && resumeExtensions) {
+      try {
+        const eip2612Info = await signEip2612Permit(
+          privateKey,
+          newAccepted,
+          from,
+          { validForSec: opts?.validForSec },
+        );
+        resumeExtensions = {
+          [EIP2612_GAS_SPONSORING_KEY]: { info: eip2612Info },
+        };
+      } catch {
+        // If the permit re-sign fails, keep the old extensions — the server
+        // may still accept if the allowance is already sufficient.
+      }
+    }
+
+    // Build a new PAYMENT-SIGNATURE header for the resume request.
+    const newPaymentHeader = buildPaymentHeader(
+      newAccepted,
+      newPayload,
+      resourceUrl,
+      resourceDescription,
+      resumeExtensions,
+    );
+
+    // Send the resume request with X-402-RESUME so the server can
+    // re-attach to the in-progress chat session.
+    const requestBody = { ...body, stream: true };
+    const resumeSignal = AbortSignal.timeout(opts?.timeoutMs ?? 60_000);
+    const resumeRes = await fetch(resourceUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'PAYMENT-SIGNATURE': newPaymentHeader,
+        'X-402-RESUME': topUp.resumeSession,
+      },
+      body: JSON.stringify(requestBody),
+      signal: resumeSignal,
+    });
+
+    if (resumeRes.status === 402) {
+      const text = await resumeRes.text().catch(() => '');
+      throw new PaymentError(
+        `Top-up payment rejected on attempt ${topUpCount}. Check USDC balance.`,
+        402,
+        text,
+      );
+    }
+
+    if (resumeRes.status !== 200) {
+      const text = await resumeRes.text().catch(() => '');
+      throw new PaymentError(
+        `Top-up resume failed with HTTP ${resumeRes.status} on attempt ${topUpCount}: ${text}`,
+        resumeRes.status,
+        text,
+      );
+    }
+
+    // Stream the resumed response segment.
+    const nextStream = await streamChatCompletion(resumeRes);
+
+    // Accumulate across segments.
+    accumulatedContent += nextStream.content;
+    if (nextStream.reasoningContent) {
+      accumulatedReasoning =
+        (accumulatedReasoning ?? '') + nextStream.reasoningContent;
+    }
+    // The final segment's usage carries the cumulative totals.
+    if (nextStream.usage) {
+      accumulatedUsage = nextStream.usage;
+    }
+    totalPaidUsd += Number(topUp.topUpAmount) / 1e6;
+
+    // Preserve model from earlier segments if later ones don't have it.
+    const mergedModel = nextStream.model ?? streamResult.model;
+    streamResult = { ...nextStream, model: mergedModel };
+  }
+
   // Step 8 — extract sessionId from response headers as fallback.
   const sessionId =
     streamResult.sessionId ??
     res.headers.get('X-402-SESSION') ??
     undefined;
 
-  // paidUsd = USDC amount (6 decimals) → dollars.
-  const paidUsd = Number(accepted.amount) / 1e6;
-
   return {
-    content: streamResult.content,
-    reasoningContent: streamResult.reasoningContent,
+    content: accumulatedContent,
+    reasoningContent: accumulatedReasoning || undefined,
     model: streamResult.model,
-    paidUsd,
+    paidUsd: totalPaidUsd,
     sessionId,
-    usage: streamResult.usage,
+    usage: accumulatedUsage,
   };
 }

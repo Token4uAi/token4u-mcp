@@ -1,5 +1,21 @@
 import type { Usage } from '../types.js';
 
+// ---------------------------------------------------------------------------
+// Top-up event (x402 mid-stream payment resume)
+// ---------------------------------------------------------------------------
+
+/** Data carried by a server-sent x402_top_up_required SSE event. */
+export interface X402TopUpEvent {
+  /** Opaque session token the server uses to resume the chat. */
+  resumeSession: string;
+  /** Cumulative tokens consumed so far (across all segments). */
+  consumedTokens: number;
+  /** Cumulative USDC amount consumed so far, in 6-decimal fixed-point. */
+  consumedAmount: string;
+  /** Additional USDC amount to authorise for the next segment (6-decimal). */
+  topUpAmount: string;
+}
+
 export interface StreamResult {
   content: string;
   /** Accumulated reasoning_content from GLM/DeepSeek-style deltas. */
@@ -7,6 +23,11 @@ export interface StreamResult {
   usage?: Usage;
   sessionId?: string;
   model?: string;
+  /**
+   * If set, the stream was interrupted by an x402 top-up event.
+   * The caller should resume with a new payment and `X-402-RESUME` header.
+   */
+  topUp?: X402TopUpEvent;
 }
 
 export type DeltaCallback = (delta: {
@@ -94,9 +115,30 @@ export async function streamChatCompletion(
         sessionId = parsed.session_id;
       }
 
-      // Check for error.
+      // Check for x402 top-up event first — not a real error.
       if (parsed.error) {
         const err = parsed.error as Record<string, unknown>;
+        if (err.type === 'x402_top_up_required') {
+          const topUpData = parsed.x402_top_up as
+            | Record<string, unknown>
+            | undefined;
+          if (topUpData) {
+            return {
+              content,
+              reasoningContent: reasoningContent || undefined,
+              usage,
+              sessionId,
+              model,
+              topUp: {
+                resumeSession: String(topUpData.resume_session ?? ''),
+                consumedTokens: Number(topUpData.consumed_tokens ?? 0),
+                consumedAmount: String(topUpData.consumed_amount ?? '0'),
+                topUpAmount: String(topUpData.top_up_amount ?? '0'),
+              },
+            };
+          }
+        }
+        // Real error — throw.
         const msg =
           typeof err.message === 'string'
             ? err.message
