@@ -453,6 +453,9 @@ export async function checkAllowance(
 // stale (e.g. the previous permit's settle tx hasn't been mined yet).
 let _lastPermitNonce = -1n;
 let _permitNonceLock: Promise<void> | null = null;
+// T87b: pending permit nonce — set when we sign+send a permit payment and
+// cleared once the chain nonce advances past it (previous settle mined).
+let _pendingPermitNonce: bigint | null = null;
 
 function _nextPermitNonce(): bigint {
   return _lastPermitNonce + 1n;
@@ -469,6 +472,58 @@ async function _withPermitNonceLock<T>(fn: () => Promise<T>): Promise<T> {
   } finally {
     _permitNonceLock = null;
     release();
+  }
+}
+
+/**
+ * Read the current on-chain EIP-2612 nonce, waiting (bounded) until any
+ * previously signed permit's settle tx has mined — otherwise two permits from
+ * the same wallet would reuse the nonce and the second settle would revert
+ * (the T87 root cause).
+ */
+async function readCurrentPermitNonce(from: `0x${string}`): Promise<string> {
+  const deadline = Date.now() + 25_000; // wait up to 25s for the prior settle
+  for (;;) {
+    let chainNonce: bigint;
+    try {
+      const client = getPublicClient();
+      const data = encodeFunctionData({
+        abi: USDC_NONCES_ABI,
+        functionName: 'nonces',
+        args: [from],
+      });
+      const result = await client.call({
+        to: USDC_BASE as `0x${string}`,
+        data,
+      });
+      chainNonce = result.data
+        ? BigInt(
+            String(
+              decodeFunctionResult({
+                abi: USDC_NONCES_ABI,
+                functionName: 'nonces',
+                data: result.data,
+              }) as bigint,
+            ),
+          )
+        : 0n;
+    } catch {
+      chainNonce = _pendingPermitNonce !== null ? _pendingPermitNonce + 1n : 0n;
+    }
+    if (_pendingPermitNonce === null || chainNonce > _pendingPermitNonce) {
+      _pendingPermitNonce = chainNonce;
+      _lastPermitNonce = chainNonce;
+      return String(chainNonce);
+    }
+    if (Date.now() > deadline) {
+      // Give up waiting — sign with chainNonce+1 as a best effort. The
+      // server-side T87 lock should prevent the collision in most cases.
+      const fallback = chainNonce + 1n;
+      _pendingPermitNonce = fallback;
+      _lastPermitNonce = fallback;
+      return String(fallback);
+    }
+    await new Promise((r) => setTimeout(r, 1500));
   }
 }
 
@@ -559,42 +614,11 @@ export async function signEip2612Permit(
   const nowSec = Math.floor(Date.now() / 1000);
   const deadline = String(nowSec + validForSec);
 
-  // Fetch the current EIP-2612 nonce from the USDC contract under a lock so
-  // concurrent calls never read the same nonce before the previous permit is
-  // consumed on-chain. USDC permit requires nonce == current on-chain nonce.
+  // Fetch the current EIP-2612 nonce under a lock, waiting for any prior
+  // permit's settle to mine first (T87b) — USDC permit requires
+  // nonce == current on-chain nonce.
   const nonce = await _withPermitNonceLock(async () => {
-    try {
-      const client = getPublicClient();
-      const data = encodeFunctionData({
-        abi: USDC_NONCES_ABI,
-        functionName: 'nonces',
-        args: [from],
-      });
-      const result = await client.call({
-        to: USDC_BASE as `0x${string}`,
-        data,
-      });
-      if (result.data) {
-        const chainNonce = BigInt(
-          String(
-            decodeFunctionResult({
-              abi: USDC_NONCES_ABI,
-              functionName: 'nonces',
-              data: result.data,
-            }) as bigint,
-          ),
-        );
-        // T83e: ALWAYS use the fresh chain nonce. The previous permit is
-        // consumed by the settle tx (bumping on-chain nonce) — re-reading
-        // here guarantees correctness. Only fall back to local counter if
-        // the chain read fails.
-        return String(chainNonce);
-      }
-    } catch {
-      // fall through to local counter
-    }
-    _lastPermitNonce = _lastPermitNonce + 1n;
-    return String(_lastPermitNonce);
+    return readCurrentPermitNonce(from);
   });
 
   const message = {
