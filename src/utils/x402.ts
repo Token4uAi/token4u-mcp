@@ -400,8 +400,9 @@ export async function paidChatCompletion(
   const accepted = pickFirstAccept(quote.accepts);
 
   // Step 3 — sign the authorization.
-  // Permit2 (upto scheme) when the server advertises assetTransferMethod=permit2;
-  // EIP-3009 otherwise (exact scheme or legacy upto without Permit2).
+  // Permit2 (upto scheme) is the only accepted method on token4u live
+  // (X402_ASSET_TRANSFER_METHOD=permit2). Sign Permit2; if the server still
+  // advertises EIP-3009 (legacy), fall back to it for backward compatibility.
   const account = privateKeyToAccount(privateKey);
   const from = account.address;
   const assetTransferMethod = accepted.extra?.assetTransferMethod;
