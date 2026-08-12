@@ -200,72 +200,6 @@ export function pickFirstAccept(accepts: X402Accept[]): X402Accept {
 }
 
 // ---------------------------------------------------------------------------
-// 3. signEip3009 — EIP-3009 TransferWithAuthorization
-// ---------------------------------------------------------------------------
-
-const EIP3009_TYPES = {
-  TransferWithAuthorization: [
-    { name: 'from', type: 'address' },
-    { name: 'to', type: 'address' },
-    { name: 'value', type: 'uint256' },
-    { name: 'validAfter', type: 'uint256' },
-    { name: 'validBefore', type: 'uint256' },
-    { name: 'nonce', type: 'bytes32' },
-  ],
-} as const;
-
-/**
- * Sign an EIP-3009 `TransferWithAuthorization` typed data message using the
- * caller's private key.
- *
- * The signed message authorizes a USDC transfer of `accepted.amount` to
- * `accepted.payTo` from `from`, valid for `validForSec` seconds.
- *
- * @returns The authorization details together with the hex-encoded signature.
- */
-export async function signEip3009(
-  privateKey: `0x${string}`,
-  accepted: X402Accept,
-  from: `0x${string}`,
-  opts?: { validForSec?: number },
-): Promise<PaymentPayload> {
-  const account: PrivateKeyAccount = privateKeyToAccount(privateKey);
-  const validForSec = opts?.validForSec ?? 3600;
-  const nowSec = Math.floor(Date.now() / 1000);
-
-  const nonceBytes = randomBytes(32);
-  const nonceHex = `0x${nonceBytes.toString('hex')}` as `0x${string}`;
-
-  const message = {
-    from,
-    to: accepted.payTo as `0x${string}`,
-    value: BigInt(accepted.amount),
-    validAfter: 0n,
-    validBefore: BigInt(nowSec + validForSec),
-    nonce: nonceHex,
-  } as const;
-
-  const signature = await account.signTypedData({
-    domain: { ...EIP3009_DOMAIN, verifyingContract: USDC_BASE as `0x${string}` },
-    types: EIP3009_TYPES,
-    primaryType: 'TransferWithAuthorization',
-    message,
-  });
-
-  return {
-    authorization: {
-      from,
-      to: accepted.payTo,
-      value: accepted.amount,
-      validAfter: '0',
-      validBefore: String(nowSec + validForSec),
-      nonce: nonceHex,
-    },
-    signature,
-  };
-}
-
-// ---------------------------------------------------------------------------
 // 3b. signPermit2 — Permit2 PermitWitnessTransferFrom (upto scheme)
 // ---------------------------------------------------------------------------
 
@@ -823,16 +757,16 @@ async function _paidChatCompletionOnce(
 
   // Step 3 — sign the authorization.
   // Permit2 (upto scheme) is the only accepted method on token4u live
-  // (X402_ASSET_TRANSFER_METHOD=permit2). Sign Permit2; if the server still
-  // advertises EIP-3009 (legacy), fall back to it for backward compatibility.
-  const payload =
-    assetTransferMethod === 'permit2'
-      ? await signPermit2(privateKey, accepted, from, {
-          validForSec: opts?.validForSec,
-        })
-      : await signEip3009(privateKey, accepted, from, {
-          validForSec: opts?.validForSec,
-        });
+  // T94: permit2 only — EIP-3009 removed entirely. If the server ever
+  // advertises a non-permit2 method, fail loudly instead of falling back.
+  if (assetTransferMethod !== 'permit2') {
+    throw new Error(
+      `Unsupported asset transfer method: ${assetTransferMethod} — only permit2 is supported (T94)`,
+    );
+  }
+  const payload = await signPermit2(privateKey, accepted, from, {
+    validForSec: opts?.validForSec,
+  });
 
   // Attach gas-sponsoring extensions at paymentPayload level (CDP reads
   // payload.extensions — e.g. EIP-2612 permit for gasless approve).
@@ -937,15 +871,10 @@ async function _paidChatCompletionOnce(
     );
     const newAccepted: X402Accept = { ...accepted, amount: newAmount };
 
-    // Sign a fresh authorization for the updated ceiling.
-    const newPayload =
-      assetTransferMethod === 'permit2'
-        ? await signPermit2(privateKey, newAccepted, from, {
-            validForSec: opts?.validForSec,
-          })
-        : await signEip3009(privateKey, newAccepted, from, {
-            validForSec: opts?.validForSec,
-          });
+    // T94: permit2 only — fresh authorization for the updated ceiling.
+    const newPayload = await signPermit2(privateKey, newAccepted, from, {
+      validForSec: opts?.validForSec,
+    });
 
     // T88b: the gas-sponsoring extensions (EIP-2612 permit) must be RE-SIGNED
     // for the top-up too — the original permit's nonce was consumed by the

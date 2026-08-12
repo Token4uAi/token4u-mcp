@@ -7,7 +7,6 @@ import { privateKeyToAccount } from 'viem/accounts';
 import {
   fetchX402Quote,
   pickFirstAccept,
-  signEip3009,
   signPermit2,
   signEip2612Permit,
   detectGasSponsoringExtensions,
@@ -170,66 +169,6 @@ describe('pickFirstAccept', () => {
 
   it('throws PaymentError for empty array', () => {
     assert.throws(() => pickFirstAccept([]), PaymentError);
-  });
-});
-
-describe('signEip3009', () => {
-  it('produces a valid EIP-3009 TransferWithAuthorization signature', async () => {
-    const payload = await signEip3009(
-      TEST_PRIVATE_KEY,
-      FIXTURE_ACCEPT,
-      TEST_ADDRESS,
-      { validForSec: 3600 },
-    );
-
-    // signEip3009 always returns authorization + signature.
-    const sig = payload.signature!;
-    const auth = payload.authorization!;
-
-    // Verify structure.
-    assert.ok(sig.startsWith('0x'));
-    assert.strictEqual(auth.from, TEST_ADDRESS);
-    assert.strictEqual(auth.to, FIXTURE_ACCEPT.payTo);
-    assert.strictEqual(auth.value, FIXTURE_ACCEPT.amount);
-    assert.strictEqual(auth.validAfter, '0');
-    assert.ok(auth.nonce.startsWith('0x'));
-    assert.strictEqual(auth.nonce.length, 66); // 32 bytes hex
-
-    // Verify the signature cryptographically.
-    const recovered = await recoverTypedDataAddress({
-      domain: {
-        name: 'USD Coin',
-        version: '2',
-        chainId: 8453,
-        verifyingContract:
-          '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
-      },
-      types: {
-        TransferWithAuthorization: [
-          { name: 'from', type: 'address' },
-          { name: 'to', type: 'address' },
-          { name: 'value', type: 'uint256' },
-          { name: 'validAfter', type: 'uint256' },
-          { name: 'validBefore', type: 'uint256' },
-          { name: 'nonce', type: 'bytes32' },
-        ],
-      },
-      primaryType: 'TransferWithAuthorization',
-      message: {
-        from: TEST_ADDRESS as `0x${string}`,
-        to: FIXTURE_ACCEPT.payTo as `0x${string}`,
-        value: BigInt(FIXTURE_ACCEPT.amount),
-        validAfter: 0n,
-        validBefore: BigInt(Number(auth.validBefore)),
-        nonce: auth.nonce as `0x${string}`,
-      },
-      signature: sig,
-    });
-
-    assert.strictEqual(
-      recovered.toLowerCase(),
-      TEST_ADDRESS.toLowerCase(),
-    );
   });
 });
 
@@ -764,7 +703,7 @@ describe('paidChatCompletion — gasless approve (T83)', () => {
     );
   });
 
-  it('throws CDP sponsoring hint when erc20ApprovalGasSponsoring is available', async () => {
+  it('falls back to CDP approval sponsoring when allowance is insufficient (T94: permit2 only)', async () => {
     const cdpAccept: X402Accept = {
       ...FIXTURE_PERMIT2_ACCEPT,
       extra: {
@@ -787,7 +726,9 @@ describe('paidChatCompletion — gasless approve (T83)', () => {
       { status: 200, headers: {}, body: '' },
     );
 
-    await assert.rejects(
+    // T94: with EIP-3009 removed, allowance=0 + erc20ApprovalGasSponsoring
+    // attempts the gas-sponsored approve path instead of an allowance error.
+    await assert.doesNotReject(
       () =>
         paidChatCompletion(
           'https://token4u.ai',
@@ -795,18 +736,9 @@ describe('paidChatCompletion — gasless approve (T83)', () => {
           TEST_PRIVATE_KEY,
           { validForSec: 3600 },
         ),
-      (err: unknown) => {
-        assert.ok(err instanceof PaymentError);
-        assert.ok(
-          (err as PaymentError).message.includes('CDP gas sponsoring'),
-          `Expected CDP sponsoring hint, got: ${(err as PaymentError).message}`,
-        );
-        assert.ok(
-          (err as PaymentError).message.includes(PERMIT2_CONTRACT),
-          'Expected Permit2 address in error message',
-        );
-        return true;
-      },
+      (err: unknown) =>
+        err instanceof PaymentError &&
+        (err as PaymentError).message.includes('Insufficient USDC allowance'),
     );
   });
 });
