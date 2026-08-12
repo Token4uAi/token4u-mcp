@@ -801,8 +801,21 @@ async function _paidChatCompletionOnce(
   // Step 6 — handle 402 rejection.
   if (res.status === 402) {
     const text = await res.text().catch(() => '');
+    // T95c: surface the server's actual error (e.g. "Duplicate payment
+    // detected", "allowance_required", top-up needed) instead of a generic
+    // balance hint — the generic message misled debugging when payments
+    // were actually settling fine.
+    let detail = text;
+    try {
+      const parsed = JSON.parse(text);
+      const err = parsed?.error || parsed?.invalidMessage || '';
+      if (typeof err === 'string' && err) detail = err;
+      if (parsed?.invalidReason) detail += ` (${parsed.invalidReason})`;
+    } catch {
+      // keep raw text
+    }
     throw new PaymentError(
-      'Payment rejected. Check your USDC balance.',
+      detail && detail !== text ? `Payment rejected: ${detail}` : 'Payment rejected.',
       402,
       text,
     );
