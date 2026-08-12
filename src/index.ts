@@ -43,7 +43,11 @@ async function main(): Promise<void> {
     `Token4u MCP Server started (v${VERSION}) — stdio transport — ${tools.length} tools: ${tools.join(', ')}`,
   );
 
-  // -- OpenAI-compatible HTTP adapter ---------------------------------------
+  // -- OpenAI-compatible HTTP adapter (DISABLED) -----------------------------
+  // T95b: the --serve / TOKEN4U_PROXY_PORT adapter mode is temporarily
+  // disabled — it is not supported in this release. The flag is ignored so
+  // the MCP server always runs stdio-only. Re-enable once the adapter is
+  // stable and supported again.
   const args = process.argv.slice(2);
   const serveIdx = args.indexOf('--serve');
   const hasServeFlag = serveIdx !== -1;
@@ -63,17 +67,9 @@ async function main(): Promise<void> {
   })();
 
   if (proxyPort !== null) {
-    try {
-      const httpServer = await startOpenAIAdapter(proxyPort);
-      const addr = httpServer.address();
-      const boundPort =
-        typeof addr === 'object' && addr ? addr.port : proxyPort;
-      console.error(
-        `OpenAI-compatible adapter listening on http://localhost:${boundPort}/v1`,
-      );
-    } catch (err) {
-      console.error('Failed to start OpenAI-compatible adapter:', err);
-    }
+    console.error(
+      '[token4u-mcp] OpenAI-compatible adapter mode is DISABLED in this release (--serve / TOKEN4U_PROXY_PORT ignored). The MCP server runs stdio-only.',
+    );
   }
 }
 
