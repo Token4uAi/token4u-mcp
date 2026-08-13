@@ -937,8 +937,23 @@ async function _paidChatCompletionOnce(
 
     if (resumeRes.status === 402) {
       const text = await resumeRes.text().catch(() => '');
+      // T95c: surface the server's actual error (permit2/allowance/top-up
+      // rejected) instead of the misleading "Check USDC balance" hint —
+      // most top-up rejections are signature/allowance/nonce issues, not
+      // insufficient balance.
+      let detail = text;
+      try {
+        const parsed = JSON.parse(text);
+        const err = parsed?.error || parsed?.invalidMessage || '';
+        if (typeof err === 'string' && err) detail = err;
+        if (parsed?.invalidReason) detail += ` (${parsed.invalidReason})`;
+      } catch {
+        // keep raw text
+      }
       throw new PaymentError(
-        `Top-up payment rejected on attempt ${topUpCount}. Check USDC balance.`,
+        detail && detail !== text
+          ? `Top-up payment rejected on attempt ${topUpCount}: ${detail}`
+          : `Top-up payment rejected on attempt ${topUpCount}.`,
         402,
         text,
       );
