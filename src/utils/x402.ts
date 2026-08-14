@@ -344,35 +344,49 @@ export async function checkAllowance(
   owner: `0x${string}`,
   amount: string,
 ): Promise<boolean> {
-  try {
-    const client = getPublicClient();
-    const data = encodeFunctionData({
-      abi: ERC20_ALLOWANCE_ABI,
-      functionName: 'allowance',
-      // T83d-fix: CDP consumes the 0x0000 (Permit2 contract) allowance via
-      // settleWithPermit — check against PERMIT2_CONTRACT.
-      args: [owner, PERMIT2_CONTRACT as `0x${string}`],
-    });
+  // T110: retry up to 3 times before failing open. The old single-attempt
+  // fail-open returned true on any RPC hiccup, which skipped the EIP-2612
+  // permit entirely → the wallet's stale low allowance then made CDP reject
+  // with `permit2_allowance_required` (observed on 3406's intermittent
+  // failures). Retrying absorbs transient RPC errors so the permit path is
+  // actually taken when the allowance is genuinely low.
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const client = getPublicClient();
+      const data = encodeFunctionData({
+        abi: ERC20_ALLOWANCE_ABI,
+        functionName: 'allowance',
+        // T83d-fix: CDP consumes the 0x0000 (Permit2 contract) allowance via
+        // settleWithPermit — check against PERMIT2_CONTRACT.
+        args: [owner, PERMIT2_CONTRACT as `0x${string}`],
+      });
 
-    const result = await client.call({
-      to: USDC_BASE as `0x${string}`,
-      data,
-    });
+      const result = await client.call({
+        to: USDC_BASE as `0x${string}`,
+        data,
+      });
 
-    if (!result.data) return false;
+      if (!result.data) return false;
 
-    const allowance = decodeFunctionResult({
-      abi: ERC20_ALLOWANCE_ABI,
-      functionName: 'allowance',
-      data: result.data,
-    });
+      const allowance = decodeFunctionResult({
+        abi: ERC20_ALLOWANCE_ABI,
+        functionName: 'allowance',
+        data: result.data,
+      });
 
-    return (allowance as bigint) >= BigInt(amount);
-  } catch {
-    // Fail open: on RPC issues, assume allowance is sufficient to avoid
-    // blocking a legitimate payment flow.
-    return true;
+      return (allowance as bigint) >= BigInt(amount);
+    } catch (err) {
+      lastErr = err;
+      if (attempt < 3) {
+        await new Promise((r) => setTimeout(r, 500 * attempt));
+      }
+    }
   }
+  // Fail open after retries: on persistent RPC issues, assume allowance is
+  // sufficient to avoid blocking a legitimate payment flow (the server will
+  // still reject with a clear permit2_allowance_required if it isn't).
+  return true;
 }
 
 /**
@@ -559,7 +573,9 @@ export async function signEip2612Permit(
     owner: from,
     // CDP validates eip2612_info.spender == PERMIT2_ADDRESS (0x0000) and
     // settleWithPermit consumes that allowance. amount must match the
-    // settlement amount — max uint256 fails CDP simulation (T83c reverted).
+    // settlement amount — max uint256 fails CDP simulation (T83c reverted),
+    // and a 2x buffer also fails verification (T110 tested: CDP rejects
+    // permit.value != payment amount with allowance_required).
     spender: PERMIT2_CONTRACT as `0x${string}`,
     value: BigInt(accepted.amount),
     nonce: BigInt(nonce),
