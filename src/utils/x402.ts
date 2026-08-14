@@ -5,6 +5,7 @@ import type { PrivateKeyAccount } from 'viem/accounts';
 import {
   createPublicClient,
   http,
+  fallback,
   encodeFunctionData,
   decodeFunctionResult,
 } from 'viem';
@@ -301,10 +302,24 @@ export async function signPermit2(
 /** Lazy-initialised viem PublicClient for on-chain eth_call reads. */
 let _publicClient: ReturnType<typeof createPublicClient> | null = null;
 
+// T111: Base RPC failover list. mainnet.base.org alone proved unreliable
+// (repeated eth_call failures on 2026-08-14), which made readCurrentPermitNonce
+// fall back to nonce=0 → CDP rejected every permit (allowance_required) and
+// the wallet's MCP channel looked dead. viem's fallback transport rotates
+// through the list when a URL errors, so a single flaky RPC no longer breaks
+// permit signing.
+const BASE_RPC_FAILOVER = [
+  BASE_RPC_URL,
+  'https://base-rpc.publicnode.com',
+  'https://mainnet.base.org',
+  'https://base.llamarpc.com',
+];
+
 function getPublicClient(): ReturnType<typeof createPublicClient> {
   if (!_publicClient) {
+    const uniqueRpcs = [...new Set(BASE_RPC_FAILOVER.filter(Boolean))];
     _publicClient = createPublicClient({
-      transport: http(BASE_RPC_URL),
+      transport: fallback(uniqueRpcs.map((url) => http(url, { timeout: 8000 }))),
     });
   }
   return _publicClient;
@@ -429,6 +444,42 @@ async function _withPermitNonceLock<T>(fn: () => Promise<T>): Promise<T> {
  * the same wallet would reuse the nonce and the second settle would revert
  * (the T87 root cause).
  */
+
+// T111: bounded retry for the nonce read — the public client already
+// failovers across RPCs; this gives transient failures a couple of extra
+// attempts before the caller falls back to the tracked pending nonce.
+async function retryReadNonce(from: `0x${string}`): Promise<bigint | null> {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const client = getPublicClient();
+      const data = encodeFunctionData({
+        abi: USDC_NONCES_ABI,
+        functionName: 'nonces',
+        args: [from],
+      });
+      const result = await client.call({
+        to: USDC_BASE as `0x${string}`,
+        data,
+      });
+      if (!result.data) return null;
+      return BigInt(
+        String(
+          decodeFunctionResult({
+            abi: USDC_NONCES_ABI,
+            functionName: 'nonces',
+            data: result.data,
+          }),
+        ),
+      );
+    } catch {
+      if (attempt < 3) {
+        await new Promise((r) => setTimeout(r, 800 * attempt));
+      }
+    }
+  }
+  return null;
+}
+
 async function readCurrentPermitNonce(from: `0x${string}`): Promise<string> {
   const deadline = Date.now() + 25_000; // wait up to 25s for the prior settle
   for (;;) {
@@ -455,8 +506,24 @@ async function readCurrentPermitNonce(from: `0x${string}`): Promise<string> {
             ),
           )
         : 0n;
-    } catch {
-      chainNonce = _pendingPermitNonce !== null ? _pendingPermitNonce + 1n : 0n;
+    } catch (err) {
+      // T111: NEVER fall back to 0 here — a nonce=0 permit is rejected by CDP
+      // (allowance_required on verification) and was the root cause of the
+      // 3406 wallet's 73 failed payments on 2026-08-14 (flaky
+      // mainnet.base.org → catch → nonce 0). The public client now has RPC
+      // failover; retry the read a few times, and only use the tracked
+      // pending nonce (never 0) as a last resort.
+      chainNonce =
+        _pendingPermitNonce !== null
+          ? _pendingPermitNonce + 1n
+          : (await retryReadNonce(from)) ?? 0n;
+      // If even the retry failed AND we have no pending nonce, throw so the
+      // caller surfaces an RPC problem instead of signing an invalid permit.
+      if (chainNonce === 0n && _pendingPermitNonce === null) {
+        throw new Error(
+          `Failed to read EIP-2612 nonce for ${from} (RPC unreachable): ${(err as Error).message}`,
+        );
+      }
     }
     if (_pendingPermitNonce === null || chainNonce > _pendingPermitNonce) {
       _pendingPermitNonce = chainNonce;
