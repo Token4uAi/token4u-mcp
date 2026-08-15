@@ -1,4 +1,8 @@
 import http from 'node:http';
+import { appendFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { hostname } from 'node:os';
+import path from 'node:path';
 
 import type { PaidChatResult } from '../utils/x402.js';
 import { PaymentError } from '../utils/x402.js';
@@ -44,6 +48,28 @@ const FALLBACK_MODELS: OpenAIModel[] = [
 
 function randomId(): string {
   return Math.random().toString(36).substring(2, 15);
+}
+
+// ---------------------------------------------------------------------------
+// Billing log — call-log.jsonl (reconciliation: INPUT/OUTPUT/CACHE/paidUsd)
+// ---------------------------------------------------------------------------
+
+function logCall(entry: Record<string, unknown>): void {
+  try {
+    const dataDir =
+      process.env.TOKEN4U_DATA_DIR ??
+      path.join(process.env.HOME ?? '.', '.token4u-mcp');
+    appendFileSync(
+      path.join(dataDir, 'call-log.jsonl'),
+      JSON.stringify(entry) + '\n',
+    );
+  } catch (logErr) {
+    console.error('[token4u-adapter] billing log write failed:', logErr);
+  }
+}
+
+function shortHash(s: string, len = 12): string {
+  return createHash('sha256').update(s.slice(0, 2000)).digest('hex').slice(0, len);
 }
 
 function readBody(req: http.IncomingMessage): Promise<string> {
@@ -249,6 +275,7 @@ async function handleRequest(
     }
 
     const wantsStream = parsed.stream === true;
+    const startMs = Date.now();
 
     // -- Wallet ---------------------------------------------------------------
     let wallet: LocalWallet | null;
@@ -279,6 +306,23 @@ async function handleRequest(
     try {
       result = await paidChat(apiUrl, payload, wallet.privateKey);
     } catch (err) {
+      const promptText = JSON.stringify(parsed.messages ?? []);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logCall({
+        ts: new Date().toISOString(),
+        tsUnix: Math.floor(Date.now() / 1000),
+        durationMs: Date.now() - startMs,
+        label: 'hermes-main',
+        model: parsed.model,
+        paidUsd: 0,
+        sessionId: null,
+        status: 'error',
+        error: errMsg,
+        caller: 'hermes-adapter',
+        promptChars: promptText.length,
+        promptPrefixHash: shortHash(promptText),
+        usage: null,
+      });
       if (err instanceof PaymentError) {
         jsonResponse(res, 402, {
           error: {
@@ -294,6 +338,32 @@ async function handleRequest(
       });
       return;
     }
+
+    // -- Billing log (ok) -----------------------------------------------------
+    const promptText = JSON.stringify(parsed.messages ?? []);
+    logCall({
+      ts: new Date().toISOString(),
+      tsUnix: Math.floor(Date.now() / 1000),
+      durationMs: Date.now() - startMs,
+      label: 'hermes-main',
+      model: parsed.model,
+      modelReturned: result.model ?? parsed.model,
+      paidUsd: result.paidUsd,
+      sessionId: result.sessionId ?? null,
+      status: 'ok',
+      caller: 'hermes-adapter',
+      promptChars: promptText.length,
+      promptPrefixHash: shortHash(promptText),
+      usage: result.usage
+        ? {
+            promptTokens: result.usage.promptTokens,
+            completionTokens: result.usage.completionTokens,
+            totalTokens: result.usage.totalTokens,
+            cachedTokens: result.usage.cachedTokens,
+            cacheCreationTokens: result.usage.cacheCreationTokens,
+          }
+        : null,
+    });
 
     // -- Build response -------------------------------------------------------
     const model = result.model ?? parsed.model;
@@ -311,6 +381,18 @@ async function handleRequest(
         Connection: 'keep-alive',
       });
 
+      const delta: Record<string, unknown> = { content: result.content };
+      // T112: pass the model's reasoning_content through so Hermes (and the
+      // user) sees the full thinking trace. deepseek-v4-flash is a thinking
+      // model — a large fraction of completion tokens go to reasoning_content,
+      // and the final content can be a short fragment when the output budget
+      // is exhausted by thinking. Dropping reasoning made the response look
+      // like a half-sentence with no explanation (16:59 incident).
+      if ((result as PaidChatResult & { reasoningContent?: string }).reasoningContent) {
+        delta.reasoning_content = (
+          result as PaidChatResult & { reasoningContent?: string }
+        ).reasoningContent;
+      }
       const chunk = {
         id: chatId,
         object: 'chat.completion.chunk',
@@ -319,7 +401,7 @@ async function handleRequest(
         choices: [
           {
             index: 0,
-            delta: { content: result.content },
+            delta,
             finish_reason: 'stop',
           },
         ],
@@ -332,6 +414,17 @@ async function handleRequest(
     }
 
     // Non-streaming response.
+    const message: Record<string, unknown> = {
+      role: 'assistant',
+      content: result.content,
+    };
+    // T112: pass reasoning_content through (thinking model trace).
+    const reasoningContent = (
+      result as PaidChatResult & { reasoningContent?: string }
+    ).reasoningContent;
+    if (reasoningContent) {
+      message.reasoning_content = reasoningContent;
+    }
     const response: Record<string, unknown> = {
       id: chatId,
       object: 'chat.completion',
@@ -340,7 +433,7 @@ async function handleRequest(
       choices: [
         {
           index: 0,
-          message: { role: 'assistant', content: result.content },
+          message,
           finish_reason: 'stop',
         },
       ],
