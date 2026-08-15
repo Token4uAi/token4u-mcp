@@ -9,7 +9,7 @@ import { PaymentError } from '../utils/x402.js';
 import { paidChatCompletion } from '../utils/x402.js';
 import type { LocalWallet } from '../utils/wallet.js';
 import { loadLocalWallet } from '../utils/wallet.js';
-import { TOKEN4U_API_URL } from '../config.js';
+import { TOKEN4U_API_URL, TOKEN4U_TIMEOUT_MS } from '../config.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -304,7 +304,12 @@ async function handleRequest(
 
     let result: PaidChatResult;
     try {
-      result = await paidChat(apiUrl, payload, wallet.privateKey);
+      result = await paidChat(apiUrl, payload, wallet.privateKey, {
+        // T112: thinking models need a generous upstream window — the old
+        // 30s default aborted long reasoning-heavy responses (500 timeout)
+        // before reasoning_content could ever be returned to the client.
+        timeoutMs: TOKEN4U_TIMEOUT_MS,
+      });
     } catch (err) {
       const promptText = JSON.stringify(parsed.messages ?? []);
       const errMsg = err instanceof Error ? err.message : String(err);

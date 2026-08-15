@@ -11,6 +11,21 @@ export const TOKEN4U_WALLET_KEY = process.env.TOKEN4U_WALLET_KEY;
 
 export const TOKEN4U_BUDGET_LIMIT = process.env.TOKEN4U_BUDGET_LIMIT;
 
+/**
+ * Upstream x402 chat-completion timeout in ms.
+ *
+ * Default 300s: deepseek-v4-flash (and other thinking models) spend a large
+ * fraction of generation time on reasoning_content before producing the
+ * final answer. The previous hard 30s AbortSignal.timeout caused long,
+ * reasoning-heavy requests to be aborted server-side with
+ * "The operation was aborted due to timeout" (HTTP 500) — the 0.3.17
+ * reasoning passthrough (T112) was unreachable for exactly the requests it
+ * was meant to fix. Override via TOKEN4U_TIMEOUT_MS.
+ */
+export const TOKEN4U_TIMEOUT_MS = process.env.TOKEN4U_TIMEOUT_MS
+  ? parseInt(process.env.TOKEN4U_TIMEOUT_MS, 10)
+  : 300_000;
+
 export const TOKEN4U_PROXY_PORT = process.env.TOKEN4U_PROXY_PORT
   ? parseInt(process.env.TOKEN4U_PROXY_PORT, 10)
   : null;
