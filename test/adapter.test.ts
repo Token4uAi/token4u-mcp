@@ -284,6 +284,35 @@ describe('POST /v1/chat/completions — success', () => {
       server.close();
     }
   });
+
+  it('passes retryEmptyContent: true to paidChat (T118)', async () => {
+    let capturedOpts: Record<string, unknown> | undefined;
+
+    const { baseUrl, server } = await setupAdapter({
+      paidChat: async (_url, _body, _key, opts) => {
+        capturedOpts = opts as Record<string, unknown> | undefined;
+        return MOCK_CHAT_RESULT;
+      },
+      loadWallet: fakeLoadWallet(MOCK_WALLET),
+    });
+
+    try {
+      const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'deepseek-v3',
+          messages: [{ role: 'user', content: 'Hello' }],
+        }),
+      });
+
+      assert.strictEqual(res.status, 200);
+      assert.ok(capturedOpts, 'paidChat should have been called with options');
+      assert.strictEqual(capturedOpts?.retryEmptyContent, true);
+    } finally {
+      server.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -107,6 +107,18 @@ export interface PaidChatOptions {
    * upstream stream to complete. Fires across top-up resumes without pause.
    */
   onDelta?: DeltaCallback;
+  /**
+   * T118: when true, an empty content result (trimmed content length 0)
+   * automatically re-runs the full payment flow (new permit + new payment)
+   * up to `maxEmptyContentRetries` times. Guards against thinking models
+   * (deepseek-v4-flash etc.) that burn their whole completion budget on
+   * reasoning_content and return an empty `content`. Every retry pays again,
+   * so the returned `paidUsd` is the cumulative total across all attempts —
+   * callers use it for billing/budget reconciliation.
+   */
+  retryEmptyContent?: boolean;
+  /** Max automatic empty-content retries (default 2 → 3 total attempts). */
+  maxEmptyContentRetries?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -712,6 +724,19 @@ export function buildPaymentHeader(
 // ---------------------------------------------------------------------------
 
 /**
+ * T118: max automatic empty-content retries. An empty `content` (after trim)
+ * means the model spent its whole completion budget on reasoning_content and
+ * produced no answer — retry the full paid flow up to this many times before
+ * returning the (possibly still empty) result to the caller.
+ */
+const MAX_EMPTY_CONTENT_RETRIES = 2;
+
+/** T118: true when a result has no non-whitespace `content`. */
+function isEmptyContent(content: string | undefined): boolean {
+  return (content ?? '').trim().length === 0;
+}
+
+/**
  * Execute a complete x402 paid chat completion against a token4u-compatible
  * endpoint.
  *
@@ -736,10 +761,61 @@ export async function paidChatCompletion(
   opts?: PaidChatOptions,
 ): Promise<PaidChatResult> {
   const maxAttempts = opts?.maxPaymentAttempts ?? 3;
+  const retryEmptyContent = opts?.retryEmptyContent === true;
+  const maxEmptyContentRetries =
+    opts?.maxEmptyContentRetries ?? MAX_EMPTY_CONTENT_RETRIES;
+  // T118: overall deadline for the empty-content retry loop — the whole
+  // attempt + retry sequence must not exceed T117's 900s total-duration
+  // safety net (each individual stream fetch already has its own 900s cap).
+  const emptyContentDeadline = Date.now() + TOKEN4U_STREAM_TOTAL_TIMEOUT_MS;
+
   let lastErr: Error | null = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      return await _paidChatCompletionOnce(baseUrl, body, privateKey, opts);
+      let result = await _paidChatCompletionOnce(baseUrl, body, privateKey, opts);
+      if (!retryEmptyContent) return result;
+
+      // T118: empty-content retry. Re-run the full payment flow (new permit
+      // + new payment) when the model returned no content. Each retry costs a
+      // fresh payment; we return the cumulative total in `paidUsd` so the
+      // caller's billing/budget log reconciles the real spend.
+      let totalPaidUsd = result.paidUsd;
+      for (
+        let retry = 1;
+        retry <= maxEmptyContentRetries && isEmptyContent(result.content);
+        retry++
+      ) {
+        if (Date.now() >= emptyContentDeadline) {
+          console.error(
+            `[token4u-adapter] empty content, retry ${retry}/${maxEmptyContentRetries} skipped: ` +
+              `overall ${TOKEN4U_STREAM_TOTAL_TIMEOUT_MS}ms safety net exceeded`,
+          );
+          break;
+        }
+        console.error(
+          `[token4u-adapter] empty content, retry ${retry}/${maxEmptyContentRetries}`,
+        );
+        const next = await _paidChatCompletionOnce(
+          baseUrl,
+          body,
+          privateKey,
+          opts,
+        );
+        totalPaidUsd += next.paidUsd;
+        console.error(
+          `[token4u-adapter] empty content, retry ${retry}/${maxEmptyContentRetries}: ` +
+            `paid $${next.paidUsd.toFixed(6)} this attempt ` +
+            `(cumulative $${totalPaidUsd.toFixed(6)})`,
+        );
+        result = next;
+      }
+
+      // Report the total across attempts (only differs when we actually
+      // retried) so downstream billing/budget tracking is accurate.
+      if (totalPaidUsd !== result.paidUsd) {
+        result = { ...result, paidUsd: totalPaidUsd };
+      }
+      return result;
     } catch (err) {
       lastErr = err as Error;
       const msg = (err as Error).message || '';

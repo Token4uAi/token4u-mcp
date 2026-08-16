@@ -101,6 +101,11 @@ export async function chatWithToken4u(
   try {
     result = await deps.paidChat(deps.apiUrl, body, wallet.privateKey, {
       timeoutMs: TOKEN4U_TIMEOUT_MS,
+      // T118: thinking models (deepseek-v4-flash) randomly return empty
+      // `content`. Re-run the full paid flow up to 2× on empty content so
+      // the MCP tool doesn't surface an empty answer to the caller. Each
+      // retry pays again — result.paidUsd is the cumulative total.
+      retryEmptyContent: true,
     });
   } catch (err) {
     if (err instanceof PaymentError) {

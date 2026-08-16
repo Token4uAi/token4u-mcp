@@ -742,3 +742,94 @@ describe('paidChatCompletion — gasless approve (T83)', () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// Empty-content retry (T118)
+// ---------------------------------------------------------------------------
+
+describe('paidChatCompletion — empty content retry (T118)', () => {
+  const PERMIT2_QUOTE_HEADER = Buffer.from(
+    JSON.stringify({ x402Version: 2, accepts: [FIXTURE_PERMIT2_ACCEPT] }),
+  ).toString('base64');
+
+  const EMPTY_SSE = [
+    'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+    'data: [DONE]\n\n',
+  ].join('');
+
+  const OK_SSE = [
+    'data: {"id":"c2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hello"}}]}\n\n',
+    'data: {"id":"c2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+    'data: [DONE]\n\n',
+  ].join('');
+
+  it('re-runs the full paid flow when content is empty and returns the successful retry', async () => {
+    // Each attempt = 1 quote fetch (402) + 1 payment stream (200). Allowance
+    // is sufficient so no EIP-2612 permit (and no nonce RPC) is needed.
+    mockFetchWithRpc(
+      { allowance: RPC_ALLOWANCE_1USDC },
+      // Attempt 1 — empty content.
+      { status: 402, headers: { 'PAYMENT-REQUIRED': PERMIT2_QUOTE_HEADER }, body: '' },
+      { status: 200, headers: { 'content-type': 'text/event-stream' }, body: EMPTY_SSE },
+      // Retry 1 — real content.
+      { status: 402, headers: { 'PAYMENT-REQUIRED': PERMIT2_QUOTE_HEADER }, body: '' },
+      { status: 200, headers: { 'content-type': 'text/event-stream' }, body: OK_SSE },
+    );
+
+    const result = await paidChatCompletion(
+      'https://token4u.ai',
+      { model: 'test', messages: [{ role: 'user', content: 'hi' }] },
+      TEST_PRIVATE_KEY,
+      { validForSec: 3600, retryEmptyContent: true },
+    );
+
+    assert.strictEqual(result.content, 'Hello');
+    // Each attempt pays 1 USDC — the retry pays again, total = 2 USDC.
+    assert.strictEqual(result.paidUsd, 2.0);
+  });
+
+  it('returns the last empty result after max retries (total 3 attempts)', async () => {
+    mockFetchWithRpc(
+      { allowance: RPC_ALLOWANCE_1USDC },
+      // Attempt 1.
+      { status: 402, headers: { 'PAYMENT-REQUIRED': PERMIT2_QUOTE_HEADER }, body: '' },
+      { status: 200, headers: { 'content-type': 'text/event-stream' }, body: EMPTY_SSE },
+      // Retry 1.
+      { status: 402, headers: { 'PAYMENT-REQUIRED': PERMIT2_QUOTE_HEADER }, body: '' },
+      { status: 200, headers: { 'content-type': 'text/event-stream' }, body: EMPTY_SSE },
+      // Retry 2.
+      { status: 402, headers: { 'PAYMENT-REQUIRED': PERMIT2_QUOTE_HEADER }, body: '' },
+      { status: 200, headers: { 'content-type': 'text/event-stream' }, body: EMPTY_SSE },
+    );
+
+    const result = await paidChatCompletion(
+      'https://token4u.ai',
+      { model: 'test', messages: [{ role: 'user', content: 'hi' }] },
+      TEST_PRIVATE_KEY,
+      { validForSec: 3600, retryEmptyContent: true },
+    );
+
+    // Still empty after 3 attempts — return the original result, don't hide it.
+    assert.strictEqual(result.content, '');
+    // 3 attempts × 1 USDC each.
+    assert.strictEqual(result.paidUsd, 3.0);
+  });
+
+  it('does not retry empty content when retryEmptyContent is not set', async () => {
+    mockFetchWithRpc(
+      { allowance: RPC_ALLOWANCE_1USDC },
+      { status: 402, headers: { 'PAYMENT-REQUIRED': PERMIT2_QUOTE_HEADER }, body: '' },
+      { status: 200, headers: { 'content-type': 'text/event-stream' }, body: EMPTY_SSE },
+    );
+
+    const result = await paidChatCompletion(
+      'https://token4u.ai',
+      { model: 'test', messages: [{ role: 'user', content: 'hi' }] },
+      TEST_PRIVATE_KEY,
+      { validForSec: 3600 },
+    );
+
+    assert.strictEqual(result.content, '');
+    assert.strictEqual(result.paidUsd, 1.0);
+  });
+});

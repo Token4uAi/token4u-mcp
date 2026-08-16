@@ -325,8 +325,15 @@ async function handleRequest(
         // 30s default aborted long reasoning-heavy responses (500 timeout)
         // before reasoning_content could ever be returned to the client.
         timeoutMs: TOKEN4U_TIMEOUT_MS,
+        // T118: thinking models (deepseek-v4-flash) randomly return empty
+        // `content` (budget spent on reasoning_content). Re-run the paid
+        // flow up to 2× inside paidChatCompletion so Hermes doesn't see an
+        // Empty-response and fall back to the official provider. Each retry
+        // pays again — the returned paidUsd is the cumulative total.
+        retryEmptyContent: true,
         // T878: forward each upstream delta as an SSE chunk. onDelta keeps
-        // firing across top-up resumes, so the client never sees a pause.
+        // firing across top-up resumes (and across T118 empty-content
+        // retries), so the client never sees a pause.
         onDelta: wantsStream
           ? (delta) => {
               const chunk = {

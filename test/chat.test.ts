@@ -202,6 +202,23 @@ describe('chatWithToken4u', () => {
     assert.strictEqual(captured.temperature, 0);
   });
 
+  it('passes retryEmptyContent: true to paidChat (T118)', async () => {
+    let capturedOpts: Record<string, unknown> | undefined;
+    const budget = makeBudget();
+    const deps = makeDeps({
+      paidChat: async (_url, _body, _key, opts) => {
+        capturedOpts = opts as Record<string, unknown> | undefined;
+        return { content: 'OK', model: 'deepseek-v3', paidUsd: 0.01 };
+      },
+    });
+
+    const result = await chatWithToken4u(CHAT_INPUT, budget, deps);
+
+    assert.strictEqual(result.isError, false);
+    assert.ok(capturedOpts, 'paidChat should have been called with options');
+    assert.strictEqual(capturedOpts?.retryEmptyContent, true);
+  });
+
   // -----------------------------------------------------------------------
   // Success flow — budget tracking
   // -----------------------------------------------------------------------

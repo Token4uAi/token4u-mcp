@@ -760,3 +760,68 @@ npx tsx --test test/chat-stream.test.ts test/chat.test.ts   # 23/23 pass（4 新
 - 大 context thinking model（>300s stream）唔再 abort → 回應完整到 `[DONE]`（總時長上限 900s，idle 有 chunk 就 reset）。
 - 靜止測試：stream 中途 server 停咗唔出 chunk → 60s idle 後先斷。
 - 短 output（max_tokens=3000）照常正常（chunk 密集，idle timer 不斷重置）。
+
+## T118 — 空 content 自動 retry（8787/MCP 層，唔改 Hermes）
+
+**日期**: 2026-08-17
+**狀態**: 已完成
+
+### 背景
+
+deepseek-v4-flash 係 thinking model，response 隨機出現「content 空」——大部分 completion budget 用晒喺 `reasoning_content`，真正 answer content 留空。實測空率：官方 DeepSeek 4/5（80%）、8787 MCP 3/5（60%）。Hermes 以 MCP 做主力時，收到 content 空回應 → 判定 Empty response → retry 3 次 → fallback 去官方 → 用戶見到「用 MCP 就中斷」。T117 只解決咗 timeout abort，冇解決空 content——空 content 照樣觸發 Hermes fallback。
+
+### 設計決策
+
+- **retry 邏輯放喺 `paidChatCompletion`（x402.ts）單一源頭**，由 `retryEmptyContent?: boolean` option 開關（預設 false）。adapter 同 MCP tool 都傳 `true`，唔喺各自 caller 重複實作 retry loop，避免雙重 retry（3×3）。
+- **每次 retry 都係「成個付款流程」重新執行**（新 402 quote + 新 permit + 新付款），唔係單單重試 stream——空 content 代表 model 本身燒晒 budget，要重新俾錢先有機會攞到正常 answer。
+- **3 次都空 → 交返原結果**（content 空、paidUsd 累計），唔自己吞，由 Hermes fallback 機制接手。
+- **`paidUsd` 回傳累計總額**（唔係最後一次 attempt 嘅單次金額），令 adapter 的 billing log（`call-log.jsonl`）同 chat tool 的 budget 追蹤都反映真實支出，方便對帳。
+- **streaming 路徑唔使「resend headers」**：adapter 喺呼叫前已 `writeHead(200, text/event-stream)`，retry 喺 x402.ts 內部進行，`onDelta` 持續射入同一個已開啟的 SSE 連線，`[DONE]` 只喺最後一次 attempt 完結時寫一次。empty attempt 本身冇 content delta，retry 先射 content，client 端 aggregation 結果正確。
+
+### 改動檔案
+
+| 檔案 | 改動 |
+|---|---|
+| `src/utils/x402.ts` | `PaidChatOptions` 新增 `retryEmptyContent?: boolean` + `maxEmptyContentRetries?: number`（預設 2）。新增 `MAX_EMPTY_CONTENT_RETRIES = 2` 常數 + `isEmptyContent()` helper（trim 後長度 0 判定）。`paidChatCompletion` 成功拿到結果後，若 `retryEmptyContent` 且 content 空 → 重新呼叫 `_paidChatCompletionOnce`（全付款流程）最多 2 次；每 retry 前 log `[token4u-adapter] empty content, retry N/2`，retry 後 log 當次 paid + 累計 paid；回傳 `paidUsd` 設為跨 attempt 累計總額；`emptyContentDeadline = Date.now() + TOKEN4U_STREAM_TOTAL_TIMEOUT_MS` 做整體 900s 安全網，超時就唔再 retry |
+| `src/adapter/openai-server.ts` | `paidChat(..., { timeoutMs, retryEmptyContent: true, onDelta })` — 傳 `retryEmptyContent: true`，T118 retry 喺 x402.ts 內部完成，adapter 層無需另開 loop |
+| `src/tools/chat.ts` | `paidChat(..., { timeoutMs, retryEmptyContent: true })` — MCP tool 路徑同樣啟用 |
+
+### 實作細節
+
+**retry 唔會無限**：`maxEmptyContentRetries` 預設 2（總共 3 次嘗試），外加 `emptyContentDeadline` 整體 900s 安全網（T117 的 `TOKEN4U_STREAM_TOTAL_TIMEOUT_MS`）——單次 attempt 本身已經有 900s fetch signal，整體 retry 序列再以同一上限兜底，唔會因多次 retry 累積超過安全網。
+
+**對帳 log**：每 retry 三行 log——
+1. `[token4u-adapter] empty content, retry 1/2`（觸發 retry）
+2. `[token4u-adapter] empty content, retry 1/2: paid $0.001000 this attempt (cumulative $0.002000)`
+3. （若超時跳過）`[token4u-adapter] empty content, retry N/2 skipped: overall 900000ms safety net exceeded`
+
+再加上 adapter billing log（`call-log.jsonl`）記錄的 `paidUsd` 已係累計總額，retry 咗幾多次、俾咗幾多次錢都清晰可見。
+
+**成本 trade-off**：每次 retry 都係一次新付款（新 permit），空 content 率越高成本越高——呢個係以金錢換可用性嘅明確 trade-off，透過 log 清楚交代。
+
+### 驗證
+
+```bash
+npx tsc --noEmit   # exit 0（0 errors）
+npm run build      # success（dist/index.js 50.31 KB + DTS）
+```
+
+```bash
+# 新增測試（5 個，全部通過）
+npx tsx --test test/x402.test.ts   # 24 tests：20 pass / 4 fail（4 個皆 pre-existing，見下）
+npx tsx --test test/chat.test.ts   # 20/20 pass（含 1 新「passes retryEmptyContent: true」）
+npx tsx --test test/adapter.test.ts # 20/21 pass（含 1 新「passes retryEmptyContent: true」；1 個 pre-existing SSE failure）
+```
+
+**新增測試**：
+- `test/x402.test.ts` — `paidChatCompletion — empty content retry (T118)`：① empty → retry → 成功（content `Hello`，paidUsd 2.0）② 3 次都空 → 交返空結果（paidUsd 3.0）③ `retryEmptyContent` 未設 → 唔 retry（paidUsd 1.0）
+- `test/adapter.test.ts` — `passes retryEmptyContent: true to paidChat (T118)`：驗證 adapter 有傳 option
+- `test/chat.test.ts` — `passes retryEmptyContent: true to paidChat (T118)`：驗證 MCP tool 有傳 option
+
+**pre-existing 失敗（HEAD 上同樣失敗，與本 task 無關）**：`test/x402.test.ts` 的 `completes the full x402 flow` / `throws PaymentError when payment is rejected (second 402)` / `handles non-SSE JSON success response`（T94 permit2-only 後仍用 eip3009 fixture）與 `throws descriptive error when allowance insufficient + no EIP-2612`（T83e 後 EIP-2612 恆先試）；`test/adapter.test.ts` 的 `returns SSE stream when stream:true`（T878 後 `fakePaidChat` 未 invoke `onDelta`）。共 5 個，與 T117 紀錄一致。
+
+### 手動場景對應
+
+- 8787 stream + 非 stream：空 content 會自動再付費重試最多 2 次，成功攞到 content 就回傳（adapter 非 stream 返回 `content`；stream 返回連續 SSE chunk 至 `[DONE]`）。
+- MCP tool 路徑（`token4u_chat`）：同樣啟用，空 content 自動重試，`budget.spent` 計入累計 `paidUsd`。
+- 3 次都空：回傳原空結果，Hermes 接手 fallback，唔會卡死或隱藏。
