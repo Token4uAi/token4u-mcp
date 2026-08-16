@@ -29,7 +29,7 @@ import {
 } from '../types.js';
 import type { Eip2612PermitInfo } from '../types.js';
 import { streamChatCompletion, normalizeUsage } from './chat-stream.js';
-import type { StreamResult } from './chat-stream.js';
+import type { StreamResult, DeltaCallback } from './chat-stream.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -99,6 +99,12 @@ export interface PaidChatOptions {
   resourceDescription?: string;
   /** Max payment attempts for transient permit/allowance failures (default 3). */
   maxPaymentAttempts?: number;
+  /**
+   * Optional per-delta callback forwarded to streamChatCompletion so callers
+   * can flush SSE chunks immediately (T878) instead of waiting for the whole
+   * upstream stream to complete. Fires across top-up resumes without pause.
+   */
+  onDelta?: DeltaCallback;
 }
 
 // ---------------------------------------------------------------------------
@@ -909,7 +915,7 @@ async function _paidChatCompletionOnce(
 
   let streamResult: StreamResult;
   if (contentType.includes('text/event-stream')) {
-    streamResult = await streamChatCompletion(res);
+    streamResult = await streamChatCompletion(res, opts?.onDelta);
   } else {
     const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
     const content =
@@ -1052,7 +1058,7 @@ async function _paidChatCompletionOnce(
     }
 
     // Stream the resumed response segment.
-    const nextStream = await streamChatCompletion(resumeRes);
+    const nextStream = await streamChatCompletion(resumeRes, opts?.onDelta);
 
     // Accumulate across segments.
     accumulatedContent += nextStream.content;

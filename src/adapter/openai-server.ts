@@ -302,6 +302,22 @@ async function handleRequest(
     // -- Call paidChatCompletion ----------------------------------------------
     const payload = buildChatPayload(parsed);
 
+    // T878: for streaming, establish the SSE connection up-front so deltas can
+    // be flushed to the client immediately as they arrive (instead of waiting
+    // for the whole upstream stream to complete). For non-streaming we keep
+    // headers off until the result is known so PaymentError can still return a
+    // plain 402 JSON body.
+    const chatId = `chatcmpl-${randomId()}`;
+    const created = nowUnix();
+
+    if (wantsStream) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+      });
+    }
+
     let result: PaidChatResult;
     try {
       result = await paidChat(apiUrl, payload, wallet.privateKey, {
@@ -309,6 +325,29 @@ async function handleRequest(
         // 30s default aborted long reasoning-heavy responses (500 timeout)
         // before reasoning_content could ever be returned to the client.
         timeoutMs: TOKEN4U_TIMEOUT_MS,
+        // T878: forward each upstream delta as an SSE chunk. onDelta keeps
+        // firing across top-up resumes, so the client never sees a pause.
+        onDelta: wantsStream
+          ? (delta) => {
+              const chunk = {
+                id: chatId,
+                object: 'chat.completion.chunk',
+                created,
+                model: parsed.model,
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      content: delta.content,
+                      reasoning_content: delta.reasoningContent,
+                    },
+                    finish_reason: null,
+                  },
+                ],
+              };
+              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+            }
+          : undefined,
       });
     } catch (err) {
       const promptText = JSON.stringify(parsed.messages ?? []);
@@ -328,6 +367,30 @@ async function handleRequest(
         promptPrefixHash: shortHash(promptText),
         usage: null,
       });
+      if (wantsStream) {
+        // T878: stream already started — emit a terminal error chunk (empty
+        // choices + error) then [DONE] rather than leaving the client hanging.
+        const errorChunk = {
+          id: chatId,
+          object: 'chat.completion.chunk',
+          created,
+          model: parsed.model,
+          choices: [],
+          error: {
+            message: errMsg,
+            type: err instanceof PaymentError
+              ? 'payment_required'
+              : 'server_error',
+            code: err instanceof PaymentError
+              ? 'x402_payment_rejected'
+              : undefined,
+          },
+        };
+        res.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
       if (err instanceof PaymentError) {
         jsonResponse(res, 402, {
           error: {
@@ -372,47 +435,11 @@ async function handleRequest(
 
     // -- Build response -------------------------------------------------------
     const model = result.model ?? parsed.model;
-    const chatId = `chatcmpl-${randomId()}`;
-    const created = nowUnix();
 
     if (wantsStream) {
-      // Simplified streaming: emit a single delta chunk with the full content,
-      // then [DONE]. This keeps OpenAI clients compatible while avoiding the
-      // complexity of per-token streaming (paidChatCompletion already
-      // aggregates the stream internally).
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        Connection: 'keep-alive',
-      });
-
-      const delta: Record<string, unknown> = { content: result.content };
-      // T112: pass the model's reasoning_content through so Hermes (and the
-      // user) sees the full thinking trace. deepseek-v4-flash is a thinking
-      // model — a large fraction of completion tokens go to reasoning_content,
-      // and the final content can be a short fragment when the output budget
-      // is exhausted by thinking. Dropping reasoning made the response look
-      // like a half-sentence with no explanation (16:59 incident).
-      if ((result as PaidChatResult & { reasoningContent?: string }).reasoningContent) {
-        delta.reasoning_content = (
-          result as PaidChatResult & { reasoningContent?: string }
-        ).reasoningContent;
-      }
-      const chunk = {
-        id: chatId,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [
-          {
-            index: 0,
-            delta,
-            finish_reason: 'stop',
-          },
-        ],
-      };
-
-      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      // T878: deltas were already streamed to the client during the await —
+      // just terminate the SSE stream. The billing log above still uses the
+      // aggregated result (content/paidUsd/sessionId) from the full await.
       res.write('data: [DONE]\n\n');
       res.end();
       return;

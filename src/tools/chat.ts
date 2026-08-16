@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 import type { BudgetState } from '../types.js';
-import { TOKEN4U_API_URL } from '../config.js';
+import { TOKEN4U_API_URL, TOKEN4U_TIMEOUT_MS } from '../config.js';
 import { loadLocalWallet } from '../utils/wallet.js';
 import type { LocalWallet } from '../utils/wallet.js';
 import { paidChatCompletion, PaymentError } from '../utils/x402.js';
@@ -99,7 +99,9 @@ export async function chatWithToken4u(
   // 4. Execute the x402 paid chat completion.
   let result: PaidChatResult;
   try {
-    result = await deps.paidChat(deps.apiUrl, body, wallet.privateKey);
+    result = await deps.paidChat(deps.apiUrl, body, wallet.privateKey, {
+      timeoutMs: TOKEN4U_TIMEOUT_MS,
+    });
   } catch (err) {
     if (err instanceof PaymentError) {
       return {
