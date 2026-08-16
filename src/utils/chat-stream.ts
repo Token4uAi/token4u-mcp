@@ -37,6 +37,37 @@ export type DeltaCallback = (delta: {
   finishReason?: string;
 }) => void;
 
+export interface StreamChatOptions {
+  /**
+   * Activity-based idle timeout in ms. The timer is (re)armed before every
+   * `reader.read()` and cleared as soon as a chunk arrives, so a stream that
+   * keeps producing data is never cut. Only when no chunk lands for this long
+   * is the read aborted. `0`/`undefined` disables the idle timeout.
+   */
+  idleTimeoutMs?: number;
+  /**
+   * External abort signal (e.g. a total-duration safety net). If it aborts the
+   * in-flight read is interrupted with the signal's reason.
+   */
+  signal?: AbortSignal;
+}
+
+/** Reject with `signal.reason` (or a generic abort error) once it aborts. */
+function abortPromise(signal: AbortSignal): Promise<never> {
+  const reason = (): unknown =>
+    signal.reason ?? new Error('The operation was aborted');
+  if (signal.aborted) {
+    return Promise.reject(reason());
+  }
+  return new Promise((_, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener('abort', onAbort);
+      reject(reason());
+    };
+    signal.addEventListener('abort', onAbort);
+  });
+}
+
 /**
  * Read an SSE text/event-stream response line by line,
  * accumulate `choices[0].delta.content`, and stop on `data: [DONE]`.
@@ -51,6 +82,7 @@ export type DeltaCallback = (delta: {
 export async function streamChatCompletion(
   res: Response,
   onDelta?: DeltaCallback,
+  opts?: StreamChatOptions,
 ): Promise<StreamResult> {
   if (!res.body) {
     throw new Error('Response has no readable body');
@@ -58,6 +90,58 @@ export async function streamChatCompletion(
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
+
+  // T117: activity-based idle timeout. A one-shot total-duration signal was
+  // aborted even when chunks kept flowing (long thinking-model streams); now
+  // each chunk resets the idle timer, and only a genuine stall aborts.
+  const idleTimeoutMs =
+    opts?.idleTimeoutMs && opts.idleTimeoutMs > 0 ? opts.idleTimeoutMs : 0;
+  const externalSignal = opts?.signal;
+
+  const idleController = idleTimeoutMs > 0 ? new AbortController() : null;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const clearIdleTimer = (): void => {
+    if (idleTimer !== undefined) {
+      clearTimeout(idleTimer);
+      idleTimer = undefined;
+    }
+  };
+
+  const armIdleTimer = (): void => {
+    if (!idleController) return;
+    clearIdleTimer();
+    idleTimer = setTimeout(() => {
+      idleController.abort(
+        new Error(
+          `Stream idle timeout: no chunk received for ${idleTimeoutMs}ms`,
+        ),
+      );
+    }, idleTimeoutMs);
+    // Never keep the event loop alive just to enforce an idle timeout.
+    idleTimer.unref?.();
+  };
+
+  type ReadResult = Awaited<ReturnType<typeof reader.read>>;
+
+  /** Interruptible read: races the body read against idle + external aborts. */
+  const readChunk = (): Promise<ReadResult> => {
+    if (externalSignal?.aborted) {
+      return Promise.reject(
+        externalSignal.reason ?? new Error('The operation was aborted'),
+      );
+    }
+    if (idleController?.signal.aborted) {
+      return Promise.reject(
+        idleController.signal.reason ?? new Error('The operation was aborted'),
+      );
+    }
+    const races: Promise<ReadResult>[] = [reader.read()];
+    if (idleController) races.push(abortPromise(idleController.signal));
+    if (externalSignal) races.push(abortPromise(externalSignal));
+    return races.length === 1 ? races[0] : Promise.race(races);
+  };
+
   let content = '';
   let reasoningContent = '';
   let usage: StreamResult['usage'] | undefined;
@@ -66,140 +150,154 @@ export async function streamChatCompletion(
 
   let buffer = '';
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-
-    const lines = buffer.split('\n');
-    // The last element may be incomplete; keep it in the buffer.
-    buffer = lines.pop() ?? '';
-
-    for (const line of lines) {
-      const trimmed = line.trimEnd();
-
-      // Skip empty lines, comment lines (SSE comments), and non-data lines.
-      if (trimmed === '' || trimmed.startsWith(':')) {
-        continue;
-      }
-
-      if (!trimmed.startsWith('data: ')) {
-        continue;
-      }
-
-      const payload = trimmed.slice(6); // strip "data: "
-
-      // Terminal sentinel.
-      if (payload === '[DONE]') {
-        // Drain any remaining buffer and exit.
-        buffer = '';
-        break;
-      }
-
-      let parsed: Record<string, unknown>;
+  try {
+    while (true) {
+      armIdleTimer();
+      let readResult: ReadResult;
       try {
-        parsed = JSON.parse(payload);
-      } catch {
-        // Non-JSON data line — ignore.
-        continue;
+        readResult = await readChunk();
+      } finally {
+        clearIdleTimer();
       }
+      if (readResult.done) break;
 
-      // Extract model from top-level if present.
-      if (typeof parsed.model === 'string' && !model) {
-        model = parsed.model;
-      }
+      buffer += decoder.decode(readResult.value, { stream: true });
 
-      // Extract sessionId from top-level or nested.
-      if (typeof parsed.session_id === 'string' && !sessionId) {
-        sessionId = parsed.session_id;
-      }
+      const lines = buffer.split('\n');
+      // The last element may be incomplete; keep it in the buffer.
+      buffer = lines.pop() ?? '';
 
-      // Check for x402 top-up event first — not a real error.
-      if (parsed.error) {
-        const err = parsed.error as Record<string, unknown>;
-        if (err.type === 'x402_top_up_required') {
-          const topUpData = parsed.x402_top_up as
-            | Record<string, unknown>
-            | undefined;
-          if (topUpData) {
-            return {
-              content,
-              reasoningContent: reasoningContent || undefined,
-              usage,
-              sessionId,
-              model,
-              topUp: {
-                resumeSession: String(topUpData.resume_session ?? ''),
-                consumedTokens: Number(topUpData.consumed_tokens ?? 0),
-                consumedAmount: String(topUpData.consumed_amount ?? '0'),
-                topUpAmount: String(topUpData.top_up_amount ?? '0'),
-              },
-            };
+      for (const line of lines) {
+        const trimmed = line.trimEnd();
+
+        // Skip empty lines, comment lines (SSE comments), and non-data lines.
+        if (trimmed === '' || trimmed.startsWith(':')) {
+          continue;
+        }
+
+        if (!trimmed.startsWith('data: ')) {
+          continue;
+        }
+
+        const payload = trimmed.slice(6); // strip "data: "
+
+        // Terminal sentinel.
+        if (payload === '[DONE]') {
+          // Drain any remaining buffer and exit.
+          buffer = '';
+          break;
+        }
+
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(payload);
+        } catch {
+          // Non-JSON data line — ignore.
+          continue;
+        }
+
+        // Extract model from top-level if present.
+        if (typeof parsed.model === 'string' && !model) {
+          model = parsed.model;
+        }
+
+        // Extract sessionId from top-level or nested.
+        if (typeof parsed.session_id === 'string' && !sessionId) {
+          sessionId = parsed.session_id;
+        }
+
+        // Check for x402 top-up event first — not a real error.
+        if (parsed.error) {
+          const err = parsed.error as Record<string, unknown>;
+          if (err.type === 'x402_top_up_required') {
+            const topUpData = parsed.x402_top_up as
+              | Record<string, unknown>
+              | undefined;
+            if (topUpData) {
+              return {
+                content,
+                reasoningContent: reasoningContent || undefined,
+                usage,
+                sessionId,
+                model,
+                topUp: {
+                  resumeSession: String(topUpData.resume_session ?? ''),
+                  consumedTokens: Number(topUpData.consumed_tokens ?? 0),
+                  consumedAmount: String(topUpData.consumed_amount ?? '0'),
+                  topUpAmount: String(topUpData.top_up_amount ?? '0'),
+                },
+              };
+            }
+          }
+          // Real error — throw.
+          const msg =
+            typeof err.message === 'string'
+              ? err.message
+              : JSON.stringify(err);
+          throw new Error(`Stream error: ${msg}`);
+        }
+
+        const choices = parsed.choices as
+          | Array<{ delta?: Record<string, unknown>; finish_reason?: string }>
+          | undefined;
+
+        if (!choices || choices.length === 0) {
+          // Usage may come in a standalone chunk (OpenAI format).
+          if (parsed.usage) {
+            usage = normalizeUsage(parsed.usage as Record<string, unknown>);
+          }
+          continue;
+        }
+
+        const choice = choices[0];
+        const delta = choice?.delta;
+
+        if (delta) {
+          const text =
+            typeof delta.content === 'string' ? delta.content : '';
+          const reasoning =
+            typeof delta.reasoning === 'string'
+              ? delta.reasoning
+              : undefined;
+          const reasoningContentDelta =
+            typeof delta.reasoning_content === 'string'
+              ? delta.reasoning_content
+              : undefined;
+          const finishReason =
+            typeof choice.finish_reason === 'string'
+              ? choice.finish_reason
+              : undefined;
+
+          if (text) {
+            content += text;
+          }
+
+          if (reasoningContentDelta) {
+            reasoningContent += reasoningContentDelta;
+          }
+
+          if (onDelta) {
+            onDelta({
+              content: text,
+              reasoning,
+              reasoningContent: reasoningContentDelta,
+              finishReason,
+            });
           }
         }
-        // Real error — throw.
-        const msg =
-          typeof err.message === 'string'
-            ? err.message
-            : JSON.stringify(err);
-        throw new Error(`Stream error: ${msg}`);
-      }
 
-      const choices = parsed.choices as
-        | Array<{ delta?: Record<string, unknown>; finish_reason?: string }>
-        | undefined;
-
-      if (!choices || choices.length === 0) {
-        // Usage may come in a standalone chunk (OpenAI format).
+        // Usage may appear in the final choice chunk.
         if (parsed.usage) {
           usage = normalizeUsage(parsed.usage as Record<string, unknown>);
         }
-        continue;
-      }
-
-      const choice = choices[0];
-      const delta = choice?.delta;
-
-      if (delta) {
-        const text =
-          typeof delta.content === 'string' ? delta.content : '';
-        const reasoning =
-          typeof delta.reasoning === 'string'
-            ? delta.reasoning
-            : undefined;
-        const reasoningContentDelta =
-          typeof delta.reasoning_content === 'string'
-            ? delta.reasoning_content
-            : undefined;
-        const finishReason =
-          typeof choice.finish_reason === 'string'
-            ? choice.finish_reason
-            : undefined;
-
-        if (text) {
-          content += text;
-        }
-
-        if (reasoningContentDelta) {
-          reasoningContent += reasoningContentDelta;
-        }
-
-        if (onDelta) {
-          onDelta({
-            content: text,
-            reasoning,
-            reasoningContent: reasoningContentDelta,
-            finishReason,
-          });
-        }
-      }
-
-      // Usage may appear in the final choice chunk.
-      if (parsed.usage) {
-        usage = normalizeUsage(parsed.usage as Record<string, unknown>);
       }
     }
+  } catch (err) {
+    // Release the underlying connection on abort/stream errors.
+    await reader.cancel().catch(() => {});
+    throw err;
+  } finally {
+    clearIdleTimer();
   }
 
   // Flush any remaining buffer content.

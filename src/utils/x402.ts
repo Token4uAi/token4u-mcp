@@ -21,6 +21,8 @@ import {
   EIP2612_PERMIT_TYPES,
   ERC20_ALLOWANCE_ABI,
   USDC_NONCES_ABI,
+  TOKEN4U_STREAM_TOTAL_TIMEOUT_MS,
+  TOKEN4U_STREAM_IDLE_TIMEOUT_MS,
 } from '../config.js';
 import type { Permit2Authorization as Permit2Auth } from '../types.js';
 import {
@@ -876,7 +878,11 @@ async function _paidChatCompletionOnce(
   // handler's token-limit logic, so long GLM/DS outputs were never billed
   // past the floor (revenue loss).
   const requestBody = { ...body, stream: true };
-  const signal = AbortSignal.timeout(opts?.timeoutMs ?? 30_000);
+  // T117: total-duration safety net only (900s). The previous one-shot
+  // AbortSignal.timeout(timeoutMs) aborted even while chunks kept flowing;
+  // actual mid-stream disconnection is now driven by the activity-based idle
+  // timeout inside streamChatCompletion (below).
+  const streamSignal = AbortSignal.timeout(TOKEN4U_STREAM_TOTAL_TIMEOUT_MS);
   const res = await fetch(resourceUrl, {
     method: 'POST',
     headers: {
@@ -884,7 +890,7 @@ async function _paidChatCompletionOnce(
       'PAYMENT-SIGNATURE': paymentHeader,
     },
     body: JSON.stringify(requestBody),
-    signal,
+    signal: streamSignal,
   });
 
   // Step 6 — handle 402 rejection.
@@ -915,7 +921,10 @@ async function _paidChatCompletionOnce(
 
   let streamResult: StreamResult;
   if (contentType.includes('text/event-stream')) {
-    streamResult = await streamChatCompletion(res, opts?.onDelta);
+    streamResult = await streamChatCompletion(res, opts?.onDelta, {
+      idleTimeoutMs: TOKEN4U_STREAM_IDLE_TIMEOUT_MS,
+      signal: streamSignal,
+    });
   } else {
     const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
     const content =
@@ -1012,7 +1021,9 @@ async function _paidChatCompletionOnce(
     // Send the resume request with X-402-RESUME so the server can
     // re-attach to the in-progress chat session.
     const requestBody = { ...body, stream: true };
-    const resumeSignal = AbortSignal.timeout(opts?.timeoutMs ?? 60_000);
+    // T117: same total-duration safety net + idle-timeout policy as the
+    // primary stream fetch — each resume segment gets its own 900s backstop.
+    const resumeSignal = AbortSignal.timeout(TOKEN4U_STREAM_TOTAL_TIMEOUT_MS);
     const resumeRes = await fetch(resourceUrl, {
       method: 'POST',
       headers: {
@@ -1058,7 +1069,10 @@ async function _paidChatCompletionOnce(
     }
 
     // Stream the resumed response segment.
-    const nextStream = await streamChatCompletion(resumeRes, opts?.onDelta);
+    const nextStream = await streamChatCompletion(resumeRes, opts?.onDelta, {
+      idleTimeoutMs: TOKEN4U_STREAM_IDLE_TIMEOUT_MS,
+      signal: resumeSignal,
+    });
 
     // Accumulate across segments.
     accumulatedContent += nextStream.content;

@@ -715,3 +715,48 @@ npm run typecheck  # clean
 npm test           # 82/82 pass (減少 16 個測試 — wallet 內部 action ~13 + integration ~6 個 account/transactions；新增 3 個 setup test cases)
 npm run build      # success
 ```
+
+## T117 — MCP stream timeout 改 activity-based（有 chunk 就唔斷，idle 60s 先斷）
+
+**日期**: 2026-08-16
+**狀態**: 已完成
+
+### 背景
+
+大 context（39–51 萬 tokens）+ thinking model 的 stream 總時間可以超過 300s。舊 timeout 用 `AbortSignal.timeout(timeoutMs)`（`src/utils/x402.ts` 主 fetch / resume fetch）——一次性總時長炸彈，由 fetch 開始計時。即使 chunk 一路有返，時間一到照樣 abort（`The operation was aborted due to timeout` / `stream_interrupt_abort`）。官方 DeepSeek stream 唔會咁易斷，因為佢嘅 timeout 係 activity-based（有 chunk 到達就 reset timer）。
+
+### 改動檔案
+
+| 檔案 | 改動 |
+|---|---|
+| `src/config.ts` | 新增 `TOKEN4U_STREAM_IDLE_TIMEOUT_MS`（預設 `60_000`）與 `TOKEN4U_STREAM_TOTAL_TIMEOUT_MS`（預設 `900_000`），均可 env override |
+| `src/utils/chat-stream.ts` | `streamChatCompletion` 新增第三參數 `opts?: StreamChatOptions`（`idleTimeoutMs` + `signal`）。read loop 改 activity-based：每次 `reader.read()` 前重新 arm idle timer，一收到 chunk 就 clear/reset；靜止超過 idle 時限先 abort。用 `Promise.race([reader.read(), abortPromise(idle), abortPromise(external)])` 令 idle / 外部 total signal 可以中斷 in-flight `read()`，abort 後 `reader.cancel()` 釋放連線 |
+| `src/utils/x402.ts` | 主 stream fetch 同 top-up resume fetch 由 `AbortSignal.timeout(opts?.timeoutMs)` 改為 `AbortSignal.timeout(TOKEN4U_STREAM_TOTAL_TIMEOUT_MS)`（900s 一刀切安全網）；實際斷線交由 `streamChatCompletion(..., { idleTimeoutMs: TOKEN4U_STREAM_IDLE_TIMEOUT_MS, signal })` 主導。`fetchX402Quote`（402 quote）維持 `opts.timeoutMs` 不變 |
+| `test/chat-stream.test.ts` | **新增** — 4 個測試：正常累積到 [DONE]、chunk 持續到就唔 abort（activity reset）、stream 靜止即 idle abort、外部 signal 中斷 stalled read |
+
+### 實作細節
+
+**T113 保留**：`src/tools/chat.ts` 仍傳 `timeoutMs: TOKEN4U_TIMEOUT_MS`（300s），唔使改。呢個 `timeoutMs` 係「總時長」，繼續用喺 402 quote fetch（`fetchX402Quote`）上；streaming 層則並存兩條新 timeout：idle 60s（chunk reset，主導斷線）+ 總時長 900s（一刀切，防死結）。
+
+**idle timer 唔阻 event loop**：idle timer 用 `setTimeout(...)` + `idleTimer.unref()`，stream 完成/斷線時 `finally { clearIdleTimer() }` 清走，唔會令 process 因 idle timeout 而空轉。總時長用 `AbortSignal.timeout(900_000)`（Node 內部 unref，唔會 keep alive）。
+
+**斷線語意**：
+- 有 chunk 到 → idle timer 重置 → 總時長幾耐都唔斷（>300s thinking stream 完整到 [DONE]）。
+- 靜止 60s 冇 chunk → `idleController.abort(new Error('Stream idle timeout: ...'))` → read 中斷 → `reader.cancel()` → 拋錯。
+- 總時長 900s 到（安全網）→ fetch signal abort → read 中斷 → 拋錯。
+
+### 驗證
+
+```bash
+npx tsc --noEmit   # exit 0（0 errors）
+npm run build      # success（dist/index.js 48.55 KB + DTS）
+npx tsx --test test/chat-stream.test.ts test/chat.test.ts   # 23/23 pass（4 新增 + 19 chat）
+```
+
+**已知 pre-existing 失敗（與本 task 無關，HEAD 上同樣失敗）**：`test/adapter.test.ts` 的 `returns SSE stream when stream:true`（T878 後 `fakePaidChat` 未 invoke `onDelta`）、`test/x402.test.ts` 的 `completes the full x402 flow` / `throws PaymentError when payment is rejected (second 402)` / `handles non-SSE JSON success response`（T94 permit2-only 後仍用 eip3009 fixture）與 `throws descriptive error when allowance insufficient + no EIP-2612`（T83e 後 EIP-2612 恆先試，無再拋 allowance error）。已用 `git stash` 在 HEAD 上覆現確認。
+
+### 手動場景對應
+
+- 大 context thinking model（>300s stream）唔再 abort → 回應完整到 `[DONE]`（總時長上限 900s，idle 有 chunk 就 reset）。
+- 靜止測試：stream 中途 server 停咗唔出 chunk → 60s idle 後先斷。
+- 短 output（max_tokens=3000）照常正常（chunk 密集，idle timer 不斷重置）。

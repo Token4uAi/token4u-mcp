@@ -26,6 +26,35 @@ export const TOKEN4U_TIMEOUT_MS = process.env.TOKEN4U_TIMEOUT_MS
   ? parseInt(process.env.TOKEN4U_TIMEOUT_MS, 10)
   : 300_000;
 
+/**
+ * Activity-based idle timeout for streaming chat responses (ms).
+ *
+ * While a stream is being read, every arriving chunk resets this timer; only
+ * when no chunk lands for this long is the stream aborted. This is the primary
+ * disconnect mechanism for long thinking-model streams (T117) — a stream that
+ * keeps producing data is never cut, no matter how long the total wall-clock
+ * time is. Default 60s. Override via TOKEN4U_STREAM_IDLE_TIMEOUT_MS.
+ */
+export const TOKEN4U_STREAM_IDLE_TIMEOUT_MS = process.env
+  .TOKEN4U_STREAM_IDLE_TIMEOUT_MS
+  ? parseInt(process.env.TOKEN4U_STREAM_IDLE_TIMEOUT_MS, 10)
+  : 60_000;
+
+/**
+ * Total streaming safety-net timeout (ms).
+ *
+ * A hard upper bound on a single streaming segment (main fetch or top-up
+ * resume) to prevent a deadlock where the server keeps the connection open
+ * forever without ever closing it. The idle timeout above does the
+ * day-to-day disconnection; this is only a backstop. Default 900s — long
+ * enough for large contexts (39–51 萬 tokens) + thinking models whose total
+ * stream time can exceed 300s. Override via TOKEN4U_STREAM_TOTAL_TIMEOUT_MS.
+ */
+export const TOKEN4U_STREAM_TOTAL_TIMEOUT_MS = process.env
+  .TOKEN4U_STREAM_TOTAL_TIMEOUT_MS
+  ? parseInt(process.env.TOKEN4U_STREAM_TOTAL_TIMEOUT_MS, 10)
+  : 900_000;
+
 export const TOKEN4U_PROXY_PORT = process.env.TOKEN4U_PROXY_PORT
   ? parseInt(process.env.TOKEN4U_PROXY_PORT, 10)
   : null;
