@@ -181,4 +181,73 @@ describe('streamChatCompletion', () => {
 
     assert.strictEqual(result.content, 'Hello');
   });
+
+  it('aggregates tool_calls fragments across chunks and forwards them (T122)', async () => {
+    const sseData = (obj: unknown): string => `data: ${JSON.stringify(obj)}\n\n`;
+
+    const deltas: Array<{ toolCalls?: unknown }> = [];
+    const res = immediateResponse([
+      sseData({
+        id: 'c1',
+        object: 'chat.completion.chunk',
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: 'call_1',
+                  type: 'function',
+                  function: { name: 'get_weather', arguments: '{"city":' },
+                },
+              ],
+            },
+          },
+        ],
+      }),
+      sseData({
+        id: 'c1',
+        object: 'chat.completion.chunk',
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                { index: 0, function: { arguments: '"SF"}' } },
+              ],
+            },
+          },
+        ],
+      }),
+      sseData({
+        id: 'c1',
+        object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+      }),
+      'data: [DONE]\n\n',
+    ]);
+
+    const result = await streamChatCompletion(res, (d) => {
+      deltas.push({ toolCalls: d.toolCalls });
+    });
+
+    // content stays empty but tool_calls is the answer.
+    assert.strictEqual(result.content, '');
+    assert.ok(result.toolCalls, 'result.toolCalls should be aggregated');
+    assert.strictEqual(result.toolCalls.length, 1);
+    const tc = result.toolCalls[0];
+    assert.strictEqual(tc.id, 'call_1');
+    assert.strictEqual(tc.type, 'function');
+    assert.strictEqual(tc.function?.name, 'get_weather');
+    assert.strictEqual(tc.function?.arguments, '{"city":"SF"}');
+
+    // Two tool-call deltas + one terminal finish_reason delta forwarded.
+    assert.strictEqual(deltas.length, 3);
+    assert.ok(Array.isArray(deltas[0].toolCalls));
+    assert.strictEqual(
+      (deltas[0].toolCalls as Array<Record<string, unknown>>)[0].id,
+      'call_1',
+    );
+  });
 });

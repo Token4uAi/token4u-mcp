@@ -1040,4 +1040,37 @@ describe('paidChatCompletion — empty content retry (T118)', () => {
 
     assert.strictEqual(onEmptyContentCalls, 0);
   });
+
+  it('does not retry when the result carries tool_calls (empty content is valid) (T122)', async () => {
+    const TOOL_CALL_SSE = [
+      'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]}}]}\n\n',
+      'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+      'data: [DONE]\n\n',
+    ].join('');
+
+    mockFetchWithRpc(
+      { allowance: RPC_ALLOWANCE_1USDC },
+      // Attempt 1 — tool-call completion (empty content, non-empty tool_calls).
+      { status: 402, headers: { 'PAYMENT-REQUIRED': PERMIT2_QUOTE_HEADER }, body: '' },
+      { status: 200, headers: { 'content-type': 'text/event-stream' }, body: TOOL_CALL_SSE },
+      // A would-be retry — should never be reached (would pay a 2nd time).
+      { status: 402, headers: { 'PAYMENT-REQUIRED': PERMIT2_QUOTE_HEADER }, body: '' },
+      { status: 200, headers: { 'content-type': 'text/event-stream' }, body: OK_SSE },
+    );
+
+    const result = await paidChatCompletion(
+      'https://token4u.ai',
+      { model: 'test', messages: [{ role: 'user', content: 'weather in SF?' }] },
+      TEST_PRIVATE_KEY,
+      { validForSec: 3600, retryEmptyContent: true },
+    );
+
+    // content is empty but tool_calls is a valid answer → no retry, one payment.
+    assert.strictEqual(result.content, '');
+    assert.ok(result.toolCalls, 'result.toolCalls should be preserved');
+    assert.strictEqual(result.toolCalls.length, 1);
+    assert.strictEqual(result.toolCalls[0].id, 'call_1');
+    assert.strictEqual(result.toolCalls[0].function?.name, 'get_weather');
+    assert.strictEqual(result.paidUsd, 1.0);
+  });
 });

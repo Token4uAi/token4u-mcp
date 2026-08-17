@@ -949,3 +949,57 @@ npx tsx --test test/chat-stream.test.ts test/chat.test.ts test/x402.test.ts test
 - **空 content + retry 成功**：client 已收到明確 error（唔等 30–90s），retry 成功 content 唔再補發——以「快 + 明確」換「可能等到嘅 content」。
 - **finish_reason=tool_calls 空 tool_calls**：adapter 轉發為 `stop`，Hermes 唔會 re-prompt 成 loop。
 - 連續 5 輪：空 content 輪次即時終止（遠低於 60s），有 content 輪次正常到 [DONE]。
+
+## T122 — 修 MCP adapter 唔轉發 tool_calls（tool calling 7/7 全敗根因）
+
+**日期**: 2026-08-17
+**狀態**: 已完成
+
+### 背景
+
+帶 `tools` 參數嘅 `chat/completions` 請求經 8787 7/7 全敗（`empty_completion` error）。agent 調查（deleg_3fe40be2）確認根因唔喺 token4u 平台——平台 DTO/unmarshal/全部 channel adaptor/x402 middleware 都完整保留 tools，模型其實有正常 call tool（輸出全喺 `tool_calls`、`content` 空）。真正問題喺 MCP adapter 三處：
+
+1. `src/utils/chat-stream.ts` SSE parser 只讀 `delta.content`/`delta.reasoning`/`delta.reasoning_content`，冇讀 `delta.tool_calls` → 模型 call tool 嘅輸出 adapter 完全睇唔到。
+2. `src/utils/x402.ts` `isEmptyContent` 只檢查 `content` → `content` 空但 `tool_calls` 非空都被誤判 empty → 觸發 `onEmptyContent` error + retry 2 次 → 每次 retry 收多一次錢 → 最終 7/7 全敗。
+3. `src/adapter/openai-server.ts` `onDelta` 明註「不 forward tool_calls」，且 `finish_reason === 'tool_calls'` 被 map 成 `'stop'` → client 收到空 content + `stop`，睇唔到工具調用。
+
+### 改動檔案
+
+| 檔案 | 改動 |
+|---|---|
+| `src/utils/chat-stream.ts` | ① 新增 `ToolCallDelta` 型別（`index`/`id`/`type`/`function{name,arguments}`）。② `DeltaCallback` 加 `toolCalls` field、`StreamResult` 加 `toolCalls` field。③ 新增 `normalizeToolCalls()`（驗證 + copy 原始 `delta.tool_calls`）同 `mergeToolCalls()`（按 `index` 聚合、跨 chunk 拼接 `function.arguments` 碎片）。④ SSE parser 讀 `delta.tool_calls` 並：a) 透傳原始碎片俾 `onDelta`；b) 聚合入 `StreamResult.toolCalls`。⑤ top-up early-return 同最終 return 都帶 `toolCalls` |
+| `src/utils/x402.ts` | ① `isEmptyContent` 改為「`content` 空 **AND** `toolCalls` 空」先算 empty——有 `tool_calls` 就係有效結果唔 retry。② `PaidChatResult` 加 `toolCalls` field。③ `firstAttemptOnDelta` 包裝透傳 `toolCalls`（否則 retryEmptyContent 路徑會丟咗工具碎片）。④ retry 成功 flush 帶 `toolCalls`。⑤ `_paidChatCompletionOnce` JSON 路徑 parse `message.tool_calls`、top-up loop 跨 segment 聚合、return 帶 `toolCalls` |
+| `src/adapter/openai-server.ts` | ① `onDelta` forward `delta.toolCalls`（`tool_calls` field 透傳俾 client）。② 移除 `finish_reason === 'tool_calls'` → `'stop'` 嘅 mapping，`finish_reason` 原樣轉發（T120 嗰個 mapping 改返）。③ streaming 路徑嘅空 content 檢查加 `!hasToolCalls` 條件——有 tool_calls 就唔出 empty error chunk。④ non-streaming message 帶 `tool_calls`、`finish_reason` 有 toolCalls 時設 `'tool_calls'` |
+
+### 設計決策
+
+**聚合 vs 透傳**：`onDelta` 透傳**原始** `delta.tool_calls` 碎片（含 `index`）——Hermes 係 OpenAI 兼容 client，會自己按 `index` 聚合碎片；`StreamResult`/`PaidChatResult` 先存**聚合後**嘅結果（`mergeToolCalls` 跨 chunk 拼接 `function.arguments`），供 `isEmptyContent` 同 non-streaming message 用。兩者分開，避免 client 收到重複聚合後又再聚合。
+
+**isEmptyContent 改語意（問題 2）**：`content` 空但 `tool_calls` 非空 = 模型正常 call tool，係有效完成。舊邏輯誤判 empty → retry 2 次（每次再俾錢）→ 7/7 全敗。改後 tool-call completion 只俾一次錢、直接返 tool_calls。
+
+**finish_reason 保留（問題 3）**：T120 因為 adapter 唔 forward tool_calls，所以先將 `tool_calls` map 做 `stop` 防止 Hermes re-prompt loop。而家有 forward tool_calls，client 收到工具調用後正確處理，`finish_reason='tool_calls'` 應該原樣保留（map 返 stop 反而會令 Hermes 以空 content + stop 完結）。
+
+### 驗證
+
+```bash
+npx tsc --noEmit   # exit 0（0 errors）
+npm run build      # success（dist/index.js 55.09 KB + DTS）
+```
+
+```bash
+npx tsx --test test/chat-stream.test.ts test/chat.test.ts test/x402.test.ts test/adapter.test.ts
+#   tests 82 / pass 77 / fail 5（5 個皆 pre-existing，見下）
+```
+
+**新增測試（3 個）+ 更新（1 個）**：
+- `test/chat-stream.test.ts` — `aggregates tool_calls fragments across chunks and forwards them (T122)`（兩段 arguments 碎片聚合為 `{"city":"SF"}`，onDelta 收到原始碎片）
+- `test/x402.test.ts` — `does not retry when the result carries tool_calls (empty content is valid) (T122)`（content 空 + tool_calls 非空 → 唔 retry、`paidUsd=1.0`、`toolCalls` 保留）
+- `test/adapter.test.ts` — `forwards tool_calls in the SSE delta and keeps empty content valid (T122)`（delta 帶 `tool_calls`、空 content 唔出 empty error chunk、`finish_reason` 保留）
+- `test/adapter.test.ts` — 更新 `maps finish_reason "tool_calls" to "stop" (T120)` → `preserves finish_reason "tool_calls" (T122)`（行為改為原樣保留）
+
+**pre-existing 失敗（HEAD 上同樣失敗，與本 task 無關）**：`test/x402.test.ts` 的 `completes the full x402 flow` / `throws PaymentError when payment is rejected (second 402)` / `handles non-SSE JSON success response`（T94 permit2-only 後仍用 eip3009 fixture）與 `throws descriptive error when allowance insufficient + no EIP-2612`（T83e 後 EIP-2612 恆先試）；`test/adapter.test.ts` 的 `returns SSE stream when stream:true`（T878 後 `fakePaidChat` 未 invoke `onDelta`）。共 5 個，與 T117–T120 紀錄一致。
+
+### 手動場景對應
+
+- 8787 帶 `tools`（`get_weather` 範例）：模型 output 喺 `tool_calls`（content 空）→ adapter forward `delta.tool_calls` 碎片 → 最後 chunk `finish_reason='tool_calls'` → [DONE]，唔再 `empty_completion`，唔再 retry 收多兩次錢。
+- 唔帶 `tools` 請求：`delta.tool_calls` 一直 undefined → `tool_calls` field 唔出現、`finish_reason` 照舊 → 回歸正常。

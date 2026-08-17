@@ -30,8 +30,17 @@ import {
   ERC20_APPROVAL_GAS_SPONSORING_KEY,
 } from '../types.js';
 import type { Eip2612PermitInfo } from '../types.js';
-import { streamChatCompletion, normalizeUsage } from './chat-stream.js';
-import type { StreamResult, DeltaCallback } from './chat-stream.js';
+import {
+  streamChatCompletion,
+  normalizeUsage,
+  mergeToolCalls,
+  normalizeToolCalls,
+} from './chat-stream.js';
+import type {
+  StreamResult,
+  DeltaCallback,
+  ToolCallDelta,
+} from './chat-stream.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -88,6 +97,8 @@ export interface PaidChatResult {
   content: string;
   /** Accumulated reasoning_content from GLM/DeepSeek-style deltas. */
   reasoningContent?: string;
+  /** Aggregated tool calls (streaming `delta.tool_calls` merged by index). */
+  toolCalls?: ToolCallDelta[];
   model?: string;
   /** Amount paid in USD (6-decimal USDC amount converted to dollars). */
   paidUsd: number;
@@ -741,9 +752,20 @@ export function buildPaymentHeader(
  */
 const MAX_EMPTY_CONTENT_RETRIES = 2;
 
-/** T118: true when a result has no non-whitespace `content`. */
-function isEmptyContent(content: string | undefined): boolean {
-  return (content ?? '').trim().length === 0;
+/**
+ * T118/T122: true when a result has neither non-whitespace `content` nor any
+ * `tool_calls`. A tool-calling completion legitimately returns empty `content`
+ * (the assistant's whole answer is the tool call), so it must NOT be treated
+ * as empty and re-run — otherwise every tool call would pay twice and still
+ * produce the same "empty" content.
+ */
+function isEmptyContent(
+  content: string | undefined,
+  toolCalls?: ToolCallDelta[],
+): boolean {
+  const hasContent = (content ?? '').trim().length > 0;
+  const hasToolCalls = (toolCalls?.length ?? 0) > 0;
+  return !hasContent && !hasToolCalls;
 }
 
 /**
@@ -832,6 +854,7 @@ export async function paidChatCompletion(
                 reasoning: d.reasoning,
                 reasoningContent: d.reasoningContent,
                 finishReason: undefined,
+                toolCalls: d.toolCalls,
               });
             }
           : opts?.onDelta;
@@ -851,7 +874,8 @@ export async function paidChatCompletion(
       let emptyContentSignaled = false;
       for (
         let retry = 1;
-        retry <= maxEmptyContentRetries && isEmptyContent(result.content);
+        retry <= maxEmptyContentRetries &&
+        isEmptyContent(result.content, result.toolCalls);
         retry++
       ) {
         // T120: notify the caller the moment we know the first attempt
@@ -913,11 +937,12 @@ export async function paidChatCompletion(
           // content + finish_reason as a single chunk now. If every attempt
           // stayed empty, forward nothing: the adapter emits an explicit
           // error chunk rather than a silent empty stream.
-          if (!isEmptyContent(result.content)) {
+          if (!isEmptyContent(result.content, result.toolCalls)) {
             clientOnDelta({
               content: result.content,
               reasoningContent: result.reasoningContent,
               finishReason: finalFinishReason ?? 'stop',
+              toolCalls: result.toolCalls,
             });
           }
         } else {
@@ -1142,6 +1167,11 @@ async function _paidChatCompletionOnce(
         if (msg && typeof msg.reasoning === 'string') return msg.reasoning;
         return undefined;
       })(),
+      // T122: non-streaming JSON responses carry fully-formed `message.tool_calls`.
+      toolCalls: (() => {
+        const msg = (json.choices as Array<{ message?: Record<string, unknown> }> | undefined)?.[0]?.message;
+        return normalizeToolCalls(msg?.tool_calls);
+      })(),
       model: typeof json.model === 'string' ? json.model : undefined,
       usage: json.usage
         ? normalizeUsage(json.usage as Record<string, unknown>)
@@ -1166,6 +1196,7 @@ async function _paidChatCompletionOnce(
   let topUpCount = 0;
   let accumulatedContent = streamResult.content;
   let accumulatedReasoning = streamResult.reasoningContent;
+  let accumulatedToolCalls = streamResult.toolCalls;
   let accumulatedUsage = streamResult.usage;
   let totalPaidUsd = Number(accepted.amount) / 1e6;
 
@@ -1277,6 +1308,12 @@ async function _paidChatCompletionOnce(
       accumulatedReasoning =
         (accumulatedReasoning ?? '') + nextStream.reasoningContent;
     }
+    if (nextStream.toolCalls && nextStream.toolCalls.length > 0) {
+      accumulatedToolCalls = mergeToolCalls(
+        accumulatedToolCalls ?? [],
+        nextStream.toolCalls,
+      );
+    }
     // The final segment's usage carries the cumulative totals.
     if (nextStream.usage) {
       accumulatedUsage = nextStream.usage;
@@ -1297,6 +1334,10 @@ async function _paidChatCompletionOnce(
   return {
     content: accumulatedContent,
     reasoningContent: accumulatedReasoning || undefined,
+    toolCalls:
+      accumulatedToolCalls && accumulatedToolCalls.length > 0
+        ? accumulatedToolCalls
+        : undefined,
     model: streamResult.model,
     paidUsd: totalPaidUsd,
     sessionId,

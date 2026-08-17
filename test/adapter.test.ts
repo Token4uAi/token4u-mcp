@@ -494,7 +494,7 @@ describe('POST /v1/chat/completions — streaming', () => {
     }
   });
 
-  it('maps finish_reason "tool_calls" to "stop" (T120)', async () => {
+  it('preserves finish_reason "tool_calls" (T122)', async () => {
     const { baseUrl, server } = await setupAdapter({
       paidChat: async (_url, _body, _key, opts) => {
         opts?.onDelta?.({ content: 'Hi', finishReason: 'tool_calls' });
@@ -526,7 +526,72 @@ describe('POST /v1/chat/completions — streaming', () => {
       assert.strictEqual(chunkLines.length, 1);
       const chunk = JSON.parse(chunkLines[0].slice(6)) as Record<string, unknown>;
       const choices = chunk.choices as Array<Record<string, unknown>>;
-      assert.strictEqual(choices[0].finish_reason, 'stop');
+      assert.strictEqual(choices[0].finish_reason, 'tool_calls');
+    } finally {
+      server.close();
+    }
+  });
+
+  it('forwards tool_calls in the SSE delta and keeps empty content valid (T122)', async () => {
+    const toolCall = {
+      index: 0,
+      id: 'call_1',
+      type: 'function',
+      function: { name: 'get_weather', arguments: '{"city":"SF"}' },
+    };
+    const { baseUrl, server } = await setupAdapter({
+      paidChat: async (_url, _body, _key, opts) => {
+        opts?.onDelta?.({
+          content: '',
+          toolCalls: [toolCall],
+          finishReason: 'tool_calls',
+        });
+        return {
+          content: '',
+          model: 'deepseek-v3',
+          paidUsd: 0.001,
+          toolCalls: [toolCall],
+        };
+      },
+      loadWallet: fakeLoadWallet(MOCK_WALLET),
+    });
+
+    try {
+      const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'deepseek-v3',
+          messages: [{ role: 'user', content: 'weather?' }],
+          tools: [
+            { type: 'function', function: { name: 'get_weather', parameters: {} } },
+          ],
+          stream: true,
+        }),
+      });
+
+      const text = await res.text();
+      const lines = text
+        .split('\n')
+        .map((l) => l.trimEnd())
+        .filter((l) => l.startsWith('data: '));
+
+      assert.strictEqual(lines[lines.length - 1], 'data: [DONE]');
+
+      // No empty-completion error chunk — tool_calls is a valid answer.
+      const chunkLines = lines.filter((l) => l !== 'data: [DONE]');
+      assert.strictEqual(chunkLines.length, 1);
+      const chunk = JSON.parse(chunkLines[0].slice(6)) as Record<string, unknown>;
+      const choices = chunk.choices as Array<Record<string, unknown>>;
+      assert.strictEqual(choices[0].finish_reason, 'tool_calls');
+      const delta = choices[0].delta as Record<string, unknown>;
+      const toolCalls = delta.tool_calls as Array<Record<string, unknown>>;
+      assert.ok(toolCalls, 'delta.tool_calls should be forwarded');
+      assert.strictEqual(toolCalls[0].id, 'call_1');
+      assert.strictEqual(
+        (toolCalls[0].function as Record<string, unknown>).name,
+        'get_weather',
+      );
     } finally {
       server.close();
     }

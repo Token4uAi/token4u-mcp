@@ -377,15 +377,11 @@ async function handleRequest(
         onDelta: wantsStream
           ? (delta) => {
               if (clientEnded) return;
-              // T120: the adapter does not forward tool_calls (the delta only
-              // carries content + reasoning_content). An upstream
-              // finish_reason of "tool_calls" would therefore make Hermes
-              // re-prompt into a loop with no tool_calls to consume — map it
-              // to "stop" so the client sees a normal completion.
-              const finishReason =
-                delta.finishReason === 'tool_calls'
-                  ? 'stop'
-                  : (delta.finishReason ?? null);
+              // T122: forward tool_calls (the per-chunk fragments) and keep
+              // the upstream finish_reason verbatim — including "tool_calls".
+              // With tool_calls forwarded, Hermes receives the tool invocation
+              // to consume instead of an empty completion that it would
+              // classify as Empty-response.
               const chunk = {
                 id: chatId,
                 object: 'chat.completion.chunk',
@@ -397,12 +393,15 @@ async function handleRequest(
                     delta: {
                       content: delta.content,
                       reasoning_content: delta.reasoningContent,
+                      ...(delta.toolCalls && delta.toolCalls.length > 0
+                        ? { tool_calls: delta.toolCalls }
+                        : {}),
                     },
                     // T119: forward the upstream finish_reason (when present)
                     // instead of hardcoding null. Hermes treats a non-null
                     // finish_reason as the stream-completion signal — without
                     // it every stream looks like a mid-stream drop.
-                    finish_reason: finishReason,
+                    finish_reason: delta.finishReason ?? null,
                   },
                 ],
               };
@@ -482,6 +481,9 @@ async function handleRequest(
 
     // -- Build response -------------------------------------------------------
     const model = result.model ?? parsed.model;
+    // T122: a tool-call completion has empty `content` but non-empty
+    // `toolCalls` — that is a valid answer, not an empty completion.
+    const hasToolCalls = (result.toolCalls?.length ?? 0) > 0;
 
     if (wantsStream) {
       // T120: if onEmptyContent already ended the client (empty first
@@ -496,7 +498,7 @@ async function handleRequest(
       // empty-content retry returned reasoning-only), emit an explicit error
       // chunk so Hermes sees a real error rather than a silent empty stream
       // (which it classifies as EmptyStreamError).
-      if ((result.content ?? '').trim().length === 0) {
+      if ((result.content ?? '').trim().length === 0 && !hasToolCalls) {
         const emptyChunk = {
           id: chatId,
           object: 'chat.completion.chunk',
@@ -523,6 +525,11 @@ async function handleRequest(
       role: 'assistant',
       content: result.content,
     };
+    // T122: forward aggregated tool calls on the assistant message so a
+    // non-streaming tool-call completion isn't returned as an empty message.
+    if (result.toolCalls && result.toolCalls.length > 0) {
+      message.tool_calls = result.toolCalls;
+    }
     // T112: pass reasoning_content through (thinking model trace).
     const reasoningContent = (
       result as PaidChatResult & { reasoningContent?: string }
@@ -539,7 +546,7 @@ async function handleRequest(
         {
           index: 0,
           message,
-          finish_reason: 'stop',
+          finish_reason: hasToolCalls ? 'tool_calls' : 'stop',
         },
       ],
     };
