@@ -832,4 +832,52 @@ describe('paidChatCompletion — empty content retry (T118)', () => {
     assert.strictEqual(result.content, '');
     assert.strictEqual(result.paidUsd, 1.0);
   });
+
+  it('pauses onDelta during retries and flushes final content once (T119)', async () => {
+    const deltas: Array<{
+      content?: string;
+      reasoningContent?: string;
+      finishReason?: string;
+    }> = [];
+
+    mockFetchWithRpc(
+      { allowance: RPC_ALLOWANCE_1USDC },
+      // Attempt 1 — empty content.
+      { status: 402, headers: { 'PAYMENT-REQUIRED': PERMIT2_QUOTE_HEADER }, body: '' },
+      { status: 200, headers: { 'content-type': 'text/event-stream' }, body: EMPTY_SSE },
+      // Retry 1 — real content.
+      { status: 402, headers: { 'PAYMENT-REQUIRED': PERMIT2_QUOTE_HEADER }, body: '' },
+      { status: 200, headers: { 'content-type': 'text/event-stream' }, body: OK_SSE },
+    );
+
+    const result = await paidChatCompletion(
+      'https://token4u.ai',
+      { model: 'test', messages: [{ role: 'user', content: 'hi' }] },
+      TEST_PRIVATE_KEY,
+      {
+        validForSec: 3600,
+        retryEmptyContent: true,
+        onDelta: (d) => {
+          deltas.push({
+            content: d.content,
+            reasoningContent: d.reasoningContent,
+            finishReason: d.finishReason,
+          });
+        },
+      },
+    );
+
+    assert.strictEqual(result.content, 'Hello');
+    assert.strictEqual(result.paidUsd, 2.0);
+
+    // The empty first attempt must NOT forward a finish_reason (that would
+    // make the client treat the empty stream as complete), and the retry's
+    // per-delta content/reasoning must NOT leak through (no mixing). The
+    // client sees exactly one terminal flush carrying the final content.
+    assert.strictEqual(deltas.length, 2);
+    assert.strictEqual(deltas[0].content, '');
+    assert.strictEqual(deltas[0].finishReason, undefined);
+    assert.strictEqual(deltas[1].content, 'Hello');
+    assert.strictEqual(deltas[1].finishReason, 'stop');
+  });
 });

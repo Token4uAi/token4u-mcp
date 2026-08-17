@@ -136,4 +136,49 @@ describe('streamChatCompletion', () => {
       clearTimeout(timer);
     }
   });
+
+  it('forwards finish_reason via onDelta (T119)', async () => {
+    const deltas: Array<{ content: string; finishReason?: string }> = [];
+    const res = immediateResponse([
+      sseChunk('Hello'),
+      'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+      'data: [DONE]\n\n',
+    ]);
+
+    const result = await streamChatCompletion(res, (d) => {
+      deltas.push({ content: d.content, finishReason: d.finishReason });
+    });
+
+    assert.strictEqual(result.content, 'Hello');
+    assert.strictEqual(deltas.length, 2);
+    assert.strictEqual(deltas[1].content, '');
+    assert.strictEqual(deltas[1].finishReason, 'stop');
+  });
+
+  it('terminates on finish_reason without waiting for [DONE] or body close (T119)', async () => {
+    let sent = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (!sent) {
+          sent = true;
+          controller.enqueue(encoder.encode(sseChunk('Hello')));
+          controller.enqueue(
+            encoder.encode(
+              'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+            ),
+          );
+          return;
+        }
+        // Never resolve — if the loop waits for [DONE]/body close it hangs.
+        return new Promise<never>(() => {});
+      },
+    });
+    const res = new Response(body, {
+      headers: { 'content-type': 'text/event-stream' },
+    });
+
+    const result = await streamChatCompletion(res);
+
+    assert.strictEqual(result.content, 'Hello');
+  });
 });

@@ -348,7 +348,11 @@ async function handleRequest(
                       content: delta.content,
                       reasoning_content: delta.reasoningContent,
                     },
-                    finish_reason: null,
+                    // T119: forward the upstream finish_reason (when present)
+                    // instead of hardcoding null. Hermes treats a non-null
+                    // finish_reason as the stream-completion signal — without
+                    // it every stream looks like a mid-stream drop.
+                    finish_reason: delta.finishReason ?? null,
                   },
                 ],
               };
@@ -447,6 +451,26 @@ async function handleRequest(
       // T878: deltas were already streamed to the client during the await —
       // just terminate the SSE stream. The billing log above still uses the
       // aggregated result (content/paidUsd/sessionId) from the full await.
+      // T119: if the final content is still empty (e.g. every T118
+      // empty-content retry returned reasoning-only), emit an explicit error
+      // chunk so Hermes sees a real error rather than a silent empty stream
+      // (which it classifies as EmptyStreamError).
+      if ((result.content ?? '').trim().length === 0) {
+        const emptyChunk = {
+          id: chatId,
+          object: 'chat.completion.chunk',
+          created,
+          model: parsed.model,
+          choices: [],
+          error: {
+            message:
+              'Empty completion: model returned no content after retries',
+            type: 'server_error',
+            code: 'empty_completion',
+          },
+        };
+        res.write(`data: ${JSON.stringify(emptyChunk)}\n\n`);
+      }
       res.write('data: [DONE]\n\n');
       res.end();
       return;

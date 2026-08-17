@@ -167,6 +167,12 @@ export async function streamChatCompletion(
       // The last element may be incomplete; keep it in the buffer.
       buffer = lines.pop() ?? '';
 
+      // T119: set once the upstream signals completion — either the [DONE]
+      // sentinel or a non-null `finish_reason`. We stop the read loop before
+      // [DONE] so callers never hang waiting for a [DONE] the provider may
+      // not send after `finish_reason`.
+      let reachedEnd = false;
+
       for (const line of lines) {
         const trimmed = line.trimEnd();
 
@@ -185,6 +191,7 @@ export async function streamChatCompletion(
         if (payload === '[DONE]') {
           // Drain any remaining buffer and exit.
           buffer = '';
+          reachedEnd = true;
           break;
         }
 
@@ -252,44 +259,58 @@ export async function streamChatCompletion(
         const choice = choices[0];
         const delta = choice?.delta;
 
-        if (delta) {
-          const text =
-            typeof delta.content === 'string' ? delta.content : '';
-          const reasoning =
-            typeof delta.reasoning === 'string'
-              ? delta.reasoning
-              : undefined;
-          const reasoningContentDelta =
-            typeof delta.reasoning_content === 'string'
-              ? delta.reasoning_content
-              : undefined;
-          const finishReason =
-            typeof choice.finish_reason === 'string'
-              ? choice.finish_reason
-              : undefined;
+        const text =
+          typeof delta?.content === 'string' ? delta.content : '';
+        const reasoning =
+          typeof delta?.reasoning === 'string' ? delta.reasoning : undefined;
+        const reasoningContentDelta =
+          typeof delta?.reasoning_content === 'string'
+            ? delta.reasoning_content
+            : undefined;
+        // T119: read finish_reason at the choice level (not only inside a
+        // `delta`) — a completion chunk may carry `finish_reason` with an
+        // empty or absent `delta`.
+        const finishReason =
+          typeof choice.finish_reason === 'string' && choice.finish_reason
+            ? choice.finish_reason
+            : undefined;
 
-          if (text) {
-            content += text;
-          }
+        if (text) {
+          content += text;
+        }
 
-          if (reasoningContentDelta) {
-            reasoningContent += reasoningContentDelta;
-          }
+        if (reasoningContentDelta) {
+          reasoningContent += reasoningContentDelta;
+        }
 
-          if (onDelta) {
-            onDelta({
-              content: text,
-              reasoning,
-              reasoningContent: reasoningContentDelta,
-              finishReason,
-            });
-          }
+        // Forward the delta when it carries content/reasoning, or when a
+        // finish_reason arrived (the caller needs the completion signal even
+        // if there is no accompanying delta).
+        if (onDelta && (delta || finishReason)) {
+          onDelta({
+            content: text,
+            reasoning,
+            reasoningContent: reasoningContentDelta,
+            finishReason,
+          });
         }
 
         // Usage may appear in the final choice chunk.
         if (parsed.usage) {
           usage = normalizeUsage(parsed.usage as Record<string, unknown>);
         }
+
+        // T119: upstream declared completion (e.g. "stop"/"length"). Stop the
+        // read loop now — the adapter writes its own [DONE] — rather than
+        // waiting for a [DONE] that may never arrive.
+        if (finishReason) {
+          reachedEnd = true;
+          break;
+        }
+      }
+
+      if (reachedEnd) {
+        break;
       }
     }
   } catch (err) {

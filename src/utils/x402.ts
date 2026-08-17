@@ -769,10 +769,35 @@ export async function paidChatCompletion(
   // safety net (each individual stream fetch already has its own 900s cap).
   const emptyContentDeadline = Date.now() + TOKEN4U_STREAM_TOTAL_TIMEOUT_MS;
 
+  const clientOnDelta = opts?.onDelta;
+
   let lastErr: Error | null = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      let result = await _paidChatCompletionOnce(baseUrl, body, privateKey, opts);
+      // T119: when empty-content retries are enabled, defer the first
+      // attempt's `finish_reason`. An empty first attempt must not forward its
+      // finish_reason to the client — the client would treat the stream as
+      // complete (with no content) before any retry content arrives. Content
+      // and reasoning still stream incrementally (T878/T112); only the
+      // terminal completion signal is held back.
+      let finalFinishReason: string | undefined;
+      const firstAttemptOnDelta: DeltaCallback | undefined =
+        retryEmptyContent && clientOnDelta
+          ? (d) => {
+              if (d.finishReason) finalFinishReason = d.finishReason;
+              clientOnDelta({
+                content: d.content,
+                reasoning: d.reasoning,
+                reasoningContent: d.reasoningContent,
+                finishReason: undefined,
+              });
+            }
+          : opts?.onDelta;
+
+      let result = await _paidChatCompletionOnce(baseUrl, body, privateKey, {
+        ...opts,
+        onDelta: firstAttemptOnDelta,
+      });
       if (!retryEmptyContent) return result;
 
       // T118: empty-content retry. Re-run the full payment flow (new permit
@@ -780,6 +805,7 @@ export async function paidChatCompletion(
       // fresh payment; we return the cumulative total in `paidUsd` so the
       // caller's billing/budget log reconciles the real spend.
       let totalPaidUsd = result.paidUsd;
+      let didRetry = false;
       for (
         let retry = 1;
         retry <= maxEmptyContentRetries && isEmptyContent(result.content);
@@ -795,11 +821,24 @@ export async function paidChatCompletion(
         console.error(
           `[token4u-adapter] empty content, retry ${retry}/${maxEmptyContentRetries}`,
         );
+        // T119: suppress onDelta during the retry. Reasoning fragments from a
+        // retry attempt must not leak into the client stream (they'd mix
+        // across attempts and produce a garbage stream). streamChatCompletion
+        // still accumulates the retry's content internally — we flush it once
+        // below only when the retry succeeds.
+        finalFinishReason = undefined;
         const next = await _paidChatCompletionOnce(
           baseUrl,
           body,
           privateKey,
-          opts,
+          {
+            ...opts,
+            onDelta: clientOnDelta
+              ? (d) => {
+                  if (d.finishReason) finalFinishReason = d.finishReason;
+                }
+              : undefined,
+          },
         );
         totalPaidUsd += next.paidUsd;
         console.error(
@@ -808,6 +847,32 @@ export async function paidChatCompletion(
             `(cumulative $${totalPaidUsd.toFixed(6)})`,
         );
         result = next;
+        didRetry = true;
+      }
+
+      // T119: make the final outcome visible to the client exactly once.
+      if (clientOnDelta) {
+        if (didRetry) {
+          // The successful retry's stream was suppressed — flush its final
+          // content + finish_reason as a single chunk now. If every attempt
+          // stayed empty, forward nothing: the adapter emits an explicit
+          // error chunk rather than a silent empty stream.
+          if (!isEmptyContent(result.content)) {
+            clientOnDelta({
+              content: result.content,
+              reasoningContent: result.reasoningContent,
+              finishReason: finalFinishReason ?? 'stop',
+            });
+          }
+        } else {
+          // Happy path — content streamed incrementally; send the terminal
+          // finish_reason (deferred above) as the final chunk.
+          clientOnDelta({
+            content: '',
+            reasoningContent: undefined,
+            finishReason: finalFinishReason ?? 'stop',
+          });
+        }
       }
 
       // Report the total across attempts (only differs when we actually

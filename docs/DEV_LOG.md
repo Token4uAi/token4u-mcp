@@ -825,3 +825,72 @@ npx tsx --test test/adapter.test.ts # 20/21 pass（含 1 新「passes retryEmpty
 - 8787 stream + 非 stream：空 content 會自動再付費重試最多 2 次，成功攞到 content 就回傳（adapter 非 stream 返回 `content`；stream 返回連續 SSE chunk 至 `[DONE]`）。
 - MCP tool 路徑（`token4u_chat`）：同樣啟用，空 content 自動重試，`budget.spent` 計入累計 `paidUsd`。
 - 3 次都空：回傳原空結果，Hermes 接手 fallback，唔會卡死或隱藏。
+
+## T119 — 修 8787 adapter streaming finish_reason 轉發缺陷（Hermes mid-stream drop 根因）
+
+**日期**: 2026-08-17
+**狀態**: 已完成
+
+### 背景
+
+Hermes 主 model 行 8787 時，gateway journal 每 ~16 秒報「Stream ended with no finish_reason after delivering text with no tool calls; treating as a mid-stream drop」→ EmptyStreamError → retry → fallback 官方。agent 調查（deleg_8b84c69a）確認三層根因：
+
+1. `src/adapter/openai-server.ts` onDelta 轉發硬編碼 `finish_reason: null`——upstream finish_reason 喺 `chat-stream.ts` 讀咗（存 `finishReason`），但 adapter 從未帶上。Hermes 以「收到非 null finish_reason」為 stream 完成標準 → 即使 adapter 正常完成、收咗錢、寫咗 [DONE]，Hermes 都當 mid-stream drop。
+2. `src/utils/chat-stream.ts` read loop 只有「body close / [DONE]」兩個出口，唔認非 null `finish_reason`——upstream 發咗 finish_reason 之後 adapter 仍等 [DONE]。
+3. 大 prompt（195K tokens）upstream 空 content → T118 retry 期間 onDelta 繼續轉發（reasoning 碎片跨 retry 混合）→ Hermes 收到垃圾 stream。
+
+### 改動檔案
+
+| 檔案 | 改動 |
+|---|---|
+| `src/adapter/openai-server.ts` | onDelta chunk 嘅 `finish_reason` 由硬編碼 `null` 改為 `delta.finishReason ?? null`；streaming 成功路徑若最終 `content` 仍空 → 寫一個明確 error chunk（`choices: []` + `error`），再寫 [DONE]，唔再靜默返空 stream |
+| `src/utils/chat-stream.ts` | read loop 喺收到非 null `finish_reason`（如 `stop`/`length`）即 `break`（喺 [DONE] 之前）；`finish_reason` 改喺 choice level 讀取（唔局限喺 `delta` 內），`onDelta` 喺有 `delta` 或 `finish_reason` 時都會觸發 |
+| `src/utils/x402.ts` | T118 empty-content retry loop 期間 `onDelta` 暫停（retry 重新調 `_paidChatCompletionOnce` 時傳 `onDelta: undefined`，唔再射 reasoning 碎片）；第一個 attempt 嘅 `finish_reason` 延後（defer）唔即射，retry 成功先 flush 最終 content + finish_reason 一次 |
+| `docs/DEV_LOG.md` | 新增 T119 段落（本紀錄） |
+
+### 實作細節
+
+**`openai-server.ts` onDelta**：
+```typescript
+finish_reason: delta.finishReason ?? null,
+```
+`DeltaCallback`（`chat-stream.ts`）已有 `finishReason?: string` field，型別透傳無需改動；`?? null` 處理 upstream 未帶 finish_reason 嘅 content/reasoning 碎片（保持 OpenAI streaming 格式——中間 chunk 為 null，最後 chunk 先有 `stop`）。
+
+**`chat-stream.ts` break on finish_reason**：
+- `finishReason` 由 choice level 提取（`typeof choice.finish_reason === 'string' && choice.finish_reason`），唔再局限於 `delta` 內——completion chunk 可能只帶 `finish_reason` 而 `delta` 為 `{}` 或 absent。
+- `onDelta` 觸發條件改為 `delta || finishReason`，確保 finish_reason-only chunk 都透傳畀 caller。
+- 收到 finish_reason → `reachedEnd = true` → `break` read loop（[DONE] 仍由 adapter 自行寫，協議需要）。[DONE] sentinel 同樣 set `reachedEnd`。
+
+**`x402.ts` retry pause onDelta**：
+- `retryEmptyContent` 啟用時，第一個 attempt 用 wrapper：content/reasoning 照常 incremental 射（T878/T112 保留），但 `finishReason` 被 strip（記入 `finalFinishReason`），唔會喺空 attempt 就提前向 client 宣告「stream 完成」。
+- retry loop 內改傳 capture-only `onDelta`（只記 `finishReason`，唔 forward）——reasoning 碎片唔再跨 retry 混合。
+- loop 完咗：`didRetry` 且最終有 content → flush `{content, reasoningContent, finishReason: 'stop'}` 一次；`didRetry` 且仍空 → 唔 forward（adapter 寫 error chunk）；冇 retry（happy path）→ forward terminal finish_reason（deferred 嗰個）。
+
+**empty-content 終止信號**：adapter streaming 路徑喺 `result.content` trim 後為空時寫 error chunk（`type: 'server_error'`, `code: 'empty_completion'`）+ [DONE]，取代靜默空 stream（靜默空 stream 正係 Hermes 判 EmptyStreamError 嘅原因）。
+
+### 驗證
+
+```bash
+npx tsc --noEmit   # exit 0（0 errors）
+npm run build      # success（dist/index.js 51.69 KB + DTS）
+```
+
+```bash
+# 相關測試（新增 5 個 T119 測試全 pass）
+npx tsx --test test/chat-stream.test.ts test/chat.test.ts test/x402.test.ts
+#   tests 51 / pass 47 / fail 4（4 個皆 pre-existing，見下）
+npx tsx --test test/adapter.test.ts
+#   tests 23 / pass 22 / fail 1（1 個 pre-existing，見下）
+```
+
+**新增測試（5 個）**：
+- `test/chat-stream.test.ts` — `forwards finish_reason via onDelta (T119)`（onDelta 收到 finish_reason）；`terminates on finish_reason without waiting for [DONE] or body close (T119)`（stream 喺 finish_reason 後 stalled、唔發 [DONE]，loop 照樣終止）
+- `test/x402.test.ts` — `pauses onDelta during retries and flushes final content once (T119)`（空 attempt 唔 forward finish_reason、retry 唔 forward 碎片、最終 flush content+finish_reason 一次）
+- `test/adapter.test.ts` — `forwards finish_reason from onDelta deltas (T119)`（chunk 帶非 null finish_reason）；`emits an explicit error chunk when the final content is empty (T119)`（空 content 出 error chunk + [DONE]）
+
+**pre-existing 失敗（HEAD 上同樣失敗，與本 task 無關）**：`test/x402.test.ts` 的 `completes the full x402 flow` / `throws PaymentError when payment is rejected (second 402)` / `handles non-SSE JSON success response`（T94 permit2-only 後仍用 eip3009 fixture）與 `throws descriptive error when allowance insufficient + no EIP-2612`（T83e 後 EIP-2612 恆先試）；`test/adapter.test.ts` 的 `returns SSE stream when stream:true`（T878 後 `fakePaidChat` 未 invoke `onDelta`）。共 5 個，與 T117/T118 紀錄一致。
+
+### 手動場景對應
+
+- 8787 stream 大 output（max_tokens 1500+）：Hermes 收到 content 碎片（finish_reason null）→ 最後 chunk finish_reason 非 null（`stop`）→ [DONE]，唔再判 mid-stream drop。
+- 195K prompt 空 content：第一個 attempt 空 → 唔射 finish_reason、retry 唔射 reasoning 碎片 → retry 成功 flush content+finish_reason 一次 → [DONE]；3 次都空 → adapter 寫 error chunk + [DONE]，Hermes 見到明確 error 而唔係靜默空 stream。
