@@ -119,6 +119,16 @@ export interface PaidChatOptions {
   retryEmptyContent?: boolean;
   /** Max automatic empty-content retries (default 2 → 3 total attempts). */
   maxEmptyContentRetries?: number;
+  /**
+   * T120: invoked exactly once, immediately when the first paid attempt
+   * returns empty content and empty-content retries are enabled — BEFORE the
+   * first retry runs. Lets a streaming caller (the adapter) terminate the
+   * client SSE stream right away (error chunk + [DONE]) instead of hanging
+   * for the whole 30–90s×N retry cycle. The retries below still run to
+   * completion so the returned `paidUsd` reconciles the real spend; their
+   * content is simply no longer forwarded to the already-ended client.
+   */
+  onEmptyContent?: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -737,6 +747,38 @@ function isEmptyContent(content: string | undefined): boolean {
 }
 
 /**
+ * T120: floor + multiplier applied to `max_tokens` on empty-content retries.
+ *
+ * Thinking models (deepseek-v4-flash) burn their whole completion budget on
+ * `reasoning_content` when `max_tokens` is small, leaving `content` empty.
+ * Re-running the *same* body therefore fails identically every time. Give the
+ * retry enough output budget so it has headroom beyond the reasoning phase.
+ */
+const EMPTY_RETRY_MIN_MAX_TOKENS = 1024;
+const EMPTY_RETRY_MAX_TOKENS_MULTIPLIER = 4;
+
+/**
+ * T120: build the retry body for an empty-content retry. Clones the caller's
+ * body (never mutates it) and bumps `max_tokens` to
+ * `max(1024, original × 4)`.
+ */
+function bumpMaxTokensForRetry(
+  body: Record<string, unknown>,
+): Record<string, unknown> {
+  const original =
+    typeof body.max_tokens === 'number' && Number.isFinite(body.max_tokens)
+      ? body.max_tokens
+      : 0;
+  return {
+    ...body,
+    max_tokens: Math.max(
+      EMPTY_RETRY_MIN_MAX_TOKENS,
+      Math.floor(original) * EMPTY_RETRY_MAX_TOKENS_MULTIPLIER,
+    ),
+  };
+}
+
+/**
  * Execute a complete x402 paid chat completion against a token4u-compatible
  * endpoint.
  *
@@ -806,11 +848,21 @@ export async function paidChatCompletion(
       // caller's billing/budget log reconciles the real spend.
       let totalPaidUsd = result.paidUsd;
       let didRetry = false;
+      let emptyContentSignaled = false;
       for (
         let retry = 1;
         retry <= maxEmptyContentRetries && isEmptyContent(result.content);
         retry++
       ) {
+        // T120: notify the caller the moment we know the first attempt
+        // produced no content — BEFORE any retry runs. The adapter terminates
+        // the client stream immediately (error chunk + [DONE]) instead of
+        // hanging for the whole retry cycle; the retries below still run to
+        // completion so billing logs reconcile the real spend.
+        if (!emptyContentSignaled) {
+          emptyContentSignaled = true;
+          opts?.onEmptyContent?.();
+        }
         if (Date.now() >= emptyContentDeadline) {
           console.error(
             `[token4u-adapter] empty content, retry ${retry}/${maxEmptyContentRetries} skipped: ` +
@@ -827,9 +879,13 @@ export async function paidChatCompletion(
         // still accumulates the retry's content internally — we flush it once
         // below only when the retry succeeds.
         finalFinishReason = undefined;
+        // T120: bump max_tokens on the retry body (cloned — never mutate the
+        // caller's body) so thinking models have enough output budget to
+        // actually emit content instead of burning it all on reasoning.
+        const retryBody = bumpMaxTokensForRetry(body);
         const next = await _paidChatCompletionOnce(
           baseUrl,
-          body,
+          retryBody,
           privateKey,
           {
             ...opts,

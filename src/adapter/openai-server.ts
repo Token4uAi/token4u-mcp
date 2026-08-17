@@ -318,6 +318,35 @@ async function handleRequest(
       });
     }
 
+    // T120: once the client stream is terminated (either an immediate
+    // empty-content error fired from onEmptyContent, or the normal completion),
+    // guard against any later write from a still-running background retry /
+    // final flush — a write-after-end would otherwise crash the server.
+    let clientEnded = false;
+    const endStreamWithError = (
+      message: string,
+      type: string,
+      code?: string,
+    ): void => {
+      if (clientEnded) return;
+      clientEnded = true;
+      const chunk = {
+        id: chatId,
+        object: 'chat.completion.chunk',
+        created,
+        model: parsed.model,
+        choices: [],
+        error: {
+          message,
+          type,
+          ...(code ? { code } : {}),
+        },
+      };
+      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    };
+
     let result: PaidChatResult;
     try {
       result = await paidChat(apiUrl, payload, wallet.privateKey, {
@@ -331,11 +360,32 @@ async function handleRequest(
         // Empty-response and fall back to the official provider. Each retry
         // pays again — the returned paidUsd is the cumulative total.
         retryEmptyContent: true,
+        // T120: fire the moment the first attempt comes back empty so the
+        // client stream terminates immediately instead of hanging for the
+        // whole 30–90s×N retry cycle.
+        onEmptyContent: wantsStream
+          ? () =>
+              endStreamWithError(
+                'Empty completion: model returned no content',
+                'server_error',
+                'empty_completion',
+              )
+          : undefined,
         // T878: forward each upstream delta as an SSE chunk. onDelta keeps
         // firing across top-up resumes (and across T118 empty-content
         // retries), so the client never sees a pause.
         onDelta: wantsStream
           ? (delta) => {
+              if (clientEnded) return;
+              // T120: the adapter does not forward tool_calls (the delta only
+              // carries content + reasoning_content). An upstream
+              // finish_reason of "tool_calls" would therefore make Hermes
+              // re-prompt into a loop with no tool_calls to consume — map it
+              // to "stop" so the client sees a normal completion.
+              const finishReason =
+                delta.finishReason === 'tool_calls'
+                  ? 'stop'
+                  : (delta.finishReason ?? null);
               const chunk = {
                 id: chatId,
                 object: 'chat.completion.chunk',
@@ -352,7 +402,7 @@ async function handleRequest(
                     // instead of hardcoding null. Hermes treats a non-null
                     // finish_reason as the stream-completion signal — without
                     // it every stream looks like a mid-stream drop.
-                    finish_reason: delta.finishReason ?? null,
+                    finish_reason: finishReason,
                   },
                 ],
               };
@@ -381,25 +431,11 @@ async function handleRequest(
       if (wantsStream) {
         // T878: stream already started — emit a terminal error chunk (empty
         // choices + error) then [DONE] rather than leaving the client hanging.
-        const errorChunk = {
-          id: chatId,
-          object: 'chat.completion.chunk',
-          created,
-          model: parsed.model,
-          choices: [],
-          error: {
-            message: errMsg,
-            type: err instanceof PaymentError
-              ? 'payment_required'
-              : 'server_error',
-            code: err instanceof PaymentError
-              ? 'x402_payment_rejected'
-              : undefined,
-          },
-        };
-        res.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
+        endStreamWithError(
+          errMsg,
+          err instanceof PaymentError ? 'payment_required' : 'server_error',
+          err instanceof PaymentError ? 'x402_payment_rejected' : undefined,
+        );
         return;
       }
       if (err instanceof PaymentError) {
@@ -448,6 +484,11 @@ async function handleRequest(
     const model = result.model ?? parsed.model;
 
     if (wantsStream) {
+      // T120: if onEmptyContent already ended the client (empty first
+      // attempt), do nothing further — the background retries' result is
+      // logged above but not forwarded.
+      if (clientEnded) return;
+
       // T878: deltas were already streamed to the client during the await —
       // just terminate the SSE stream. The billing log above still uses the
       // aggregated result (content/paidUsd/sessionId) from the full await.
@@ -473,6 +514,7 @@ async function handleRequest(
       }
       res.write('data: [DONE]\n\n');
       res.end();
+      clientEnded = true;
       return;
     }
 

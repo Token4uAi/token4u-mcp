@@ -894,3 +894,58 @@ npx tsx --test test/adapter.test.ts
 
 - 8787 stream 大 output（max_tokens 1500+）：Hermes 收到 content 碎片（finish_reason null）→ 最後 chunk finish_reason 非 null（`stop`）→ [DONE]，唔再判 mid-stream drop。
 - 195K prompt 空 content：第一個 attempt 空 → 唔射 finish_reason、retry 唔射 reasoning 碎片 → retry 成功 flush content+finish_reason 一次 → [DONE]；3 次都空 → adapter 寫 error chunk + [DONE]，Hermes 見到明確 error 而唔係靜默空 stream。
+
+## T120 — 修 8787 空 content retry 必敗 + 懸空 stream（bump max_tokens + 立即 error chunk）
+
+**日期**: 2026-08-17
+**狀態**: 已完成
+
+### 背景
+
+T119 已令 finish_reason 正確轉發、restart 後 gateway 0 次 mid-stream drop，但 8787 仍唔適合做 Hermes 主 model。agent 實測（deleg_28cee20b）確認殘留 3 個問題：
+
+1. **空 content retry 必敗**：T118 的 empty-content retry 用同一 body 重跑（`_paidChatCompletionOnce` 用同一個 `requestBody`）——deepseek-v4-flash 係 thinking model，大 context / 細 budget 下 reasoning 燒盡 → content 空，retry 一模一樣必敗（每次 $0.02+，實測 35 分鐘燒 $0.46）。
+2. **懸空 stream**：空 content 時 client 收唔到 error chunk + [DONE]，stream 懸空 150s–900s（error chunk + [DONE] 要等成個 retry 週期完成，每 attempt 30–90s）。
+3. **新 failure mode**：finish_reason=`tool_calls` 但 tool_calls 空 array → Hermes gateway re-prompt（實測 2/7 turn ~28%）。
+
+### 改動檔案
+
+| 檔案 | 改動 |
+|---|---|
+| `src/utils/x402.ts` | ① `PaidChatOptions` 新增 `onEmptyContent?: () => void`。② 新增 `bumpMaxTokensForRetry()` + `EMPTY_RETRY_MIN_MAX_TOKENS=1024` / `EMPTY_RETRY_MAX_TOKENS_MULTIPLIER=4` 常數——retry 前 clone body 並把 `max_tokens` bump 到 `max(1024, 原值×4)`，唔改 caller 嘅 body。③ retry loop 開頭（第一次確定空 content 時、任何 retry 跑之前）fire 一次 `onEmptyContent` |
+| `src/adapter/openai-server.ts` | ① streaming 路徑傳 `onEmptyContent` → `endStreamWithError()` 即刻寫 error chunk（choices 空 + error）+ [DONE] + `res.end()`。② 新增 `clientEnded` guard，防止 client 已終止後 background retry / final flush / catch block 再 `res.write`（write-after-end 會 crash）。③ onDelta 將 `finish_reason === 'tool_calls'` 映射為 `'stop'` |
+
+### 設計決策
+
+**bump max_tokens（問題 1）**：retry 重新調 `_paidChatCompletionOnce` 時，body 係傳入參數，retry 一定要 clone 一份先改 `max_tokens`（唔好改 caller 嘅 body）。`max_tokens` 缺失/非數字時視為 0 → bump 後即 `1024`，令 retry 恆有 output budget 唔會淨係燒 reasoning。唔做「system 加提示」——task 指引話太複雜可以唔做，只 bump max_tokens 已夠。
+
+**立即 error（問題 2）——取捨判斷**：task 俾咗兩個選項——(a) 第一次空 content 即刻 error 終止 client，retry 繼續跑但結果唔轉發；(b) retry 成功先補發 content。我揀 **(a)**，原因：retry 每 attempt 30–90s、最多 3 次，等佢成功先補發 = client 又要等 0.5–4.5 分鐘，違反「client 唔好等幾分鐘」原則同「連續 5 輪全部 ≤60s」驗證目標。代價係「成功 retry 嘅 content 唔會再轉發」——但 retry 仍然照跑（bumped max_tokens 後有真實成功機會），其累計 `paidUsd` 照常入 billing log（`call-log.jsonl`），對帳準確、兼留低 retry 成功率供判斷 8787 可否做主 model 嘅診斷數據。
+
+**onEmptyContent fire 時機**：喺 retry loop 開頭、deadline 檢查之前 fire（`emptyContentSignaled` flag 保證只 fire 一次）。咁 client 喺第一次確定空 content 當刻（未開始任何 retry）就收到終止信號，唔使等成個週期。retry 期間 `onDelta` 本來就 suppressed（T119），所以 background retry 唔會再向已關閉嘅 client 寫入。
+
+**tool_calls → stop（問題 3）**：adapter 轉發 delta 只帶 `content` + `reasoning_content`，從未帶 `tool_calls`。upstream 發 `finish_reason='tool_calls'`（即使 tool_calls 空 array）會令 Hermes 以為要接 tool 而 re-prompt 成 loop。修法係喺 adapter onDelta 將 `'tool_calls'` 映射做 `'stop'`（補發正常完成信號）。呢個位置覆蓋晒所有 client-facing 路徑——第一個 attempt 嘅 finish_reason 係 deferred（T119），最終 flush 都係經同一個 adapter onDelta，所以映射一次搞掂。非 stream 路徑本就硬編碼 `finish_reason: 'stop'`，無影響。
+
+### 驗證
+
+```bash
+npx tsc --noEmit   # exit 0（0 errors）
+npm run build      # success（dist/index.js 52.29 KB + DTS）
+```
+
+```bash
+npx tsx --test test/chat-stream.test.ts test/chat.test.ts test/x402.test.ts test/adapter.test.ts
+#   tests 79 / pass 74 / fail 5（5 個皆 pre-existing，與 T117/T118/T119 一致）
+```
+
+**新增測試（5 個，全部通過）**：
+- `test/x402.test.ts` — ① `bumps max_tokens on the empty-content retry without mutating the caller body (T120)`（用 `mockFetchCapturingBodies` 記錄每次 token4u POST body：attempt 1 付款 body `max_tokens=150`、retry body `max_tokens=1024`，且 caller 傳入嘅 body 未被改動）② `fires onEmptyContent exactly once on the first empty attempt (T120)`（空 attempt → fire 一次，retry 成功仍返 content）③ `does not fire onEmptyContent when the first attempt has content (T120)`（有 content 唔 fire）
+- `test/adapter.test.ts` — ④ `terminates the stream immediately via onEmptyContent on empty content (T120)`（mock paidChat 觸發 `opts.onEmptyContent()` → SSE 即出 error chunk（`code:'empty_completion'`）+ [DONE]，只一個 chunk）⑤ `maps finish_reason "tool_calls" to "stop" (T120)`（`finish_reason` 由 `tool_calls` 轉為 `stop`）
+
+**pre-existing 失敗（HEAD 上同樣失敗，與本 task 無關）**：`test/x402.test.ts` 的 `completes the full x402 flow` / `throws PaymentError when payment is rejected (second 402)` / `handles non-SSE JSON success response`（T94 permit2-only 後仍用 eip3009 fixture）與 `throws descriptive error when allowance insufficient + no EIP-2612`（T83e 後 EIP-2612 恆先試）；`test/adapter.test.ts` 的 `returns SSE stream when stream:true`（T878 後 `fakePaidChat` 未 invoke `onDelta`）。共 5 個。
+
+### 手動場景對應
+
+- **短輸出（max_tokens=150）空 content**：第一個 attempt 空 → `onEmptyContent` 即刻 fire → client 收 error chunk + [DONE]（唔懸空）；background retry 用 bumped `max_tokens=1024` 再跑，累計 `paidUsd` 照入 billing log。
+- **空 content + retry 成功**：client 已收到明確 error（唔等 30–90s），retry 成功 content 唔再補發——以「快 + 明確」換「可能等到嘅 content」。
+- **finish_reason=tool_calls 空 tool_calls**：adapter 轉發為 `stop`，Hermes 唔會 re-prompt 成 loop。
+- 連續 5 輪：空 content 輪次即時終止（遠低於 60s），有 content 輪次正常到 [DONE]。

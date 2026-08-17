@@ -447,6 +447,90 @@ describe('POST /v1/chat/completions — streaming', () => {
       server.close();
     }
   });
+
+  it('terminates the stream immediately via onEmptyContent on empty content (T120)', async () => {
+    let onEmptyWired = false;
+    const { baseUrl, server } = await setupAdapter({
+      paidChat: async (_url, _body, _key, opts) => {
+        // Simulate x402: the first attempt is empty → fire onEmptyContent so
+        // the adapter ends the client now; the (background) retries resolve
+        // with still-empty content afterwards.
+        opts?.onEmptyContent?.();
+        onEmptyWired = true;
+        return { content: '', model: 'deepseek-v3', paidUsd: 0.002 };
+      },
+      loadWallet: fakeLoadWallet(MOCK_WALLET),
+    });
+
+    try {
+      const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'deepseek-v3',
+          messages: [{ role: 'user', content: 'Hi' }],
+          stream: true,
+        }),
+      });
+
+      const text = await res.text();
+      const lines = text
+        .split('\n')
+        .map((l) => l.trimEnd())
+        .filter((l) => l.startsWith('data: '));
+
+      assert.ok(onEmptyWired, 'adapter should pass onEmptyContent to paidChat');
+      assert.strictEqual(lines[lines.length - 1], 'data: [DONE]');
+
+      const chunkLines = lines.filter((l) => l !== 'data: [DONE]');
+      assert.strictEqual(chunkLines.length, 1);
+      const chunk = JSON.parse(chunkLines[0].slice(6)) as Record<string, unknown>;
+      assert.strictEqual((chunk.choices as unknown[]).length, 0);
+      const err = chunk.error as Record<string, unknown>;
+      assert.ok(err);
+      assert.strictEqual(err.code, 'empty_completion');
+    } finally {
+      server.close();
+    }
+  });
+
+  it('maps finish_reason "tool_calls" to "stop" (T120)', async () => {
+    const { baseUrl, server } = await setupAdapter({
+      paidChat: async (_url, _body, _key, opts) => {
+        opts?.onDelta?.({ content: 'Hi', finishReason: 'tool_calls' });
+        return MOCK_CHAT_RESULT;
+      },
+      loadWallet: fakeLoadWallet(MOCK_WALLET),
+    });
+
+    try {
+      const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'deepseek-v3',
+          messages: [{ role: 'user', content: 'Hi' }],
+          stream: true,
+        }),
+      });
+
+      const text = await res.text();
+      const lines = text
+        .split('\n')
+        .map((l) => l.trimEnd())
+        .filter((l) => l.startsWith('data: '));
+
+      assert.strictEqual(lines[lines.length - 1], 'data: [DONE]');
+
+      const chunkLines = lines.filter((l) => l !== 'data: [DONE]');
+      assert.strictEqual(chunkLines.length, 1);
+      const chunk = JSON.parse(chunkLines[0].slice(6)) as Record<string, unknown>;
+      const choices = chunk.choices as Array<Record<string, unknown>>;
+      assert.strictEqual(choices[0].finish_reason, 'stop');
+    } finally {
+      server.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

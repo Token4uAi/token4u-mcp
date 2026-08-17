@@ -880,4 +880,164 @@ describe('paidChatCompletion — empty content retry (T118)', () => {
     assert.strictEqual(deltas[1].content, 'Hello');
     assert.strictEqual(deltas[1].finishReason, 'stop');
   });
+
+  // -------------------------------------------------------------------------
+  // T120 — empty-content retry hardening
+  // -------------------------------------------------------------------------
+
+  /** Like mockFetchWithRpc, but also records each token4u HTTP request body. */
+  function mockFetchCapturingBodies(
+    rpcResponses: Record<string, string>,
+    ...httpResponses: Array<{
+      status: number;
+      headers?: Record<string, string>;
+      body: string | (() => string);
+    }>
+  ): { bodies: string[] } {
+    const bodies: string[] = [];
+    let httpIdx = 0;
+
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      if (urlStr.includes('mainnet.base.org') || urlStr.includes('base.rpc')) {
+        const rpcBody =
+          typeof init === 'object' && init !== null
+            ? String((init as Record<string, unknown>).body ?? '')
+            : '';
+        if (rpcBody.includes('"method":"eth_call"')) {
+          if (rpcBody.includes('0xdd62ed3e')) {
+            const r = rpcResponses.allowance ?? RPC_ZERO_RESULT;
+            return new Response(r, {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            });
+          }
+          if (rpcBody.includes('0x7ecebe00')) {
+            const r = rpcResponses.nonces ?? RPC_ZERO_RESULT;
+            return new Response(r, {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            });
+          }
+        }
+        return new Response(RPC_ZERO_RESULT, {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+
+      if (typeof init === 'object' && init !== null) {
+        bodies.push(String((init as Record<string, unknown>).body ?? ''));
+      }
+      const r = httpResponses[httpIdx] ?? httpResponses[httpResponses.length - 1];
+      httpIdx += 1;
+      const bodyStr = typeof r.body === 'function' ? r.body() : r.body;
+      return {
+        status: r.status,
+        headers: new Headers(r.headers ?? {}),
+        text: async () => bodyStr,
+        json: async () => JSON.parse(bodyStr),
+        body: bodyStr
+          ? new ReadableStream({
+              start(controller) {
+                controller.enqueue(new TextEncoder().encode(bodyStr));
+                controller.close();
+              },
+            })
+          : null,
+      } as unknown as Response;
+    }) as typeof fetch;
+
+    return { bodies };
+  }
+
+  it('bumps max_tokens on the empty-content retry without mutating the caller body (T120)', async () => {
+    const { bodies } = mockFetchCapturingBodies(
+      { allowance: RPC_ALLOWANCE_1USDC },
+      // Attempt 1 — empty content.
+      { status: 402, headers: { 'PAYMENT-REQUIRED': PERMIT2_QUOTE_HEADER }, body: '' },
+      { status: 200, headers: { 'content-type': 'text/event-stream' }, body: EMPTY_SSE },
+      // Retry 1 — empty content again (still exercises the bumped body).
+      { status: 402, headers: { 'PAYMENT-REQUIRED': PERMIT2_QUOTE_HEADER }, body: '' },
+      { status: 200, headers: { 'content-type': 'text/event-stream' }, body: EMPTY_SSE },
+    );
+
+    const requestBody = {
+      model: 'test',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 150,
+    };
+
+    await paidChatCompletion('https://token4u.ai', requestBody, TEST_PRIVATE_KEY, {
+      validForSec: 3600,
+      retryEmptyContent: true,
+      // Only one retry — we assert the retry body, not a 3rd attempt.
+      maxEmptyContentRetries: 1,
+    });
+
+    // The caller's body object must never be mutated.
+    assert.strictEqual(requestBody.max_tokens, 150);
+
+    // Each attempt posts two token4u requests: 402 quote + 200 payment stream.
+    // Indices 1 and 3 are the payment POSTs for attempt 1 and retry 1.
+    const firstPayment = JSON.parse(bodies[1]) as Record<string, unknown>;
+    const retryPayment = JSON.parse(bodies[3]) as Record<string, unknown>;
+    assert.strictEqual(firstPayment.max_tokens, 150);
+    // max(1024, 150 × 4) = 1024.
+    assert.strictEqual(retryPayment.max_tokens, 1024);
+  });
+
+  it('fires onEmptyContent exactly once on the first empty attempt (T120)', async () => {
+    mockFetchWithRpc(
+      { allowance: RPC_ALLOWANCE_1USDC },
+      // Attempt 1 — empty content.
+      { status: 402, headers: { 'PAYMENT-REQUIRED': PERMIT2_QUOTE_HEADER }, body: '' },
+      { status: 200, headers: { 'content-type': 'text/event-stream' }, body: EMPTY_SSE },
+      // Retry 1 — real content.
+      { status: 402, headers: { 'PAYMENT-REQUIRED': PERMIT2_QUOTE_HEADER }, body: '' },
+      { status: 200, headers: { 'content-type': 'text/event-stream' }, body: OK_SSE },
+    );
+
+    let onEmptyContentCalls = 0;
+    const result = await paidChatCompletion(
+      'https://token4u.ai',
+      { model: 'test', messages: [{ role: 'user', content: 'hi' }] },
+      TEST_PRIVATE_KEY,
+      {
+        validForSec: 3600,
+        retryEmptyContent: true,
+        onEmptyContent: () => {
+          onEmptyContentCalls += 1;
+        },
+      },
+    );
+
+    // The retry still succeeded and its content is returned normally.
+    assert.strictEqual(result.content, 'Hello');
+    assert.strictEqual(onEmptyContentCalls, 1);
+  });
+
+  it('does not fire onEmptyContent when the first attempt has content (T120)', async () => {
+    mockFetchWithRpc(
+      { allowance: RPC_ALLOWANCE_1USDC },
+      { status: 402, headers: { 'PAYMENT-REQUIRED': PERMIT2_QUOTE_HEADER }, body: '' },
+      { status: 200, headers: { 'content-type': 'text/event-stream' }, body: OK_SSE },
+    );
+
+    let onEmptyContentCalls = 0;
+    await paidChatCompletion(
+      'https://token4u.ai',
+      { model: 'test', messages: [{ role: 'user', content: 'hi' }] },
+      TEST_PRIVATE_KEY,
+      {
+        validForSec: 3600,
+        retryEmptyContent: true,
+        onEmptyContent: () => {
+          onEmptyContentCalls += 1;
+        },
+      },
+    );
+
+    assert.strictEqual(onEmptyContentCalls, 0);
+  });
 });
